@@ -44,8 +44,12 @@ class NvidiaAIProvider(AIProvider):
             
         messages.append({"role": "user", "content": request.user_prompt})
         
+        actual_model = request.model_id if request.model_id else self.model
+        if actual_model == "ob20b":
+            actual_model = "meta/llama-3.1-8b-instruct"
+            
         payload = {
-            "model": self.model,
+            "model": actual_model,
             "messages": messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
@@ -129,7 +133,7 @@ class NvidiaAIProvider(AIProvider):
             return AIResponse(
                 content=content,
                 provider="nvidia",
-                model=self.model,
+                model=data.get("model", self.model),
                 usage=usage,
                 finish_reason=finish_reason
             )
