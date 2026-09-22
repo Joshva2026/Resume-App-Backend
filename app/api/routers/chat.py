@@ -96,7 +96,7 @@ async def chat(
     if not chat_req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
         
-    model_id = chat_req.model_id or "meta/llama-3.1-8b-instruct"
+    model_id = chat_req.model_id if chat_req.model_id else "ob20b"
     conversation_id = chat_req.conversation_id
     
     history_messages = []
