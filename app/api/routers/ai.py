@@ -113,7 +113,8 @@ CRITICAL RULES:
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         temperature=0.3, # low temperature for factual consistency
-        max_tokens=1024
+        max_tokens=1024,
+        model_id="ob20b"
     )
 
     try:
