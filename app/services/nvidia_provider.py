@@ -36,13 +36,17 @@ class NvidiaAIProvider(AIProvider):
             "Accept": "application/json"
         }
         
-        messages = [{"role": "system", "content": request.system_prompt}]
+        messages = []
         
+        final_prompt = request.user_prompt
+        if request.system_prompt:
+            final_prompt = f"System Instruction: {request.system_prompt}\n\nUser Input: {request.user_prompt}"
+            
         # Bounded context protection: ensure history isn't excessively large
         for msg in request.history:
             messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
             
-        messages.append({"role": "user", "content": request.user_prompt})
+        messages.append({"role": "user", "content": final_prompt})
         
         # Hard requirement: must be GPT-OSS-20B if specified or fallback to configured model, but NOT a local/gemini mock.
         # Ensure it doesn't silently fallback to anything else.
