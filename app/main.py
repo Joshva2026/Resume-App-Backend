@@ -14,6 +14,10 @@ app.include_router(ai.router)
 app.include_router(ats.router)
 app.include_router(chat.router)
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "ResumeForge AI Backend"}
+
 @app.get("/health")
 def health_check():
     from app.core.config import settings

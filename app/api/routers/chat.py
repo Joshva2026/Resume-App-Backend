@@ -15,11 +15,13 @@ class ChatMessageRequest(BaseModel):
     conversation_id: Optional[str] = None
     message: str
     model_id: Optional[str] = None
+    model_config = {"protected_namespaces": ()}
 
 class ChatMessageResponse(BaseModel):
     conversation_id: str
     message: str
     model_id: str
+    model_config = {"protected_namespaces": ()}
 
 class ConversationResponse(BaseModel):
     id: str
@@ -27,6 +29,7 @@ class ConversationResponse(BaseModel):
     model_id: str
     created_at: str
     updated_at: str
+    model_config = {"protected_namespaces": ()}
 
 class MessageResponse(BaseModel):
     id: str
