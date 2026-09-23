@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from app.core.config import settings
@@ -32,42 +32,60 @@ def get_jwks():
             )
     return _jwks
 
-def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+def get_current_user_id(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
-    Validates the Supabase JWT securely on the backend using the JWKS public keys.
+    Validates the Supabase JWT securely on the backend using dynamic algorithm selection.
     Returns the user's UUID string.
     """
     token = credentials.credentials
-    logger.info(f"[AUTH DIAGNOSTIC] authorization header present = True")
-    logger.info(f"[AUTH DIAGNOSTIC] scheme = {credentials.scheme}")
     
     try:
         # Decode header safely
         unverified_headers = jwt.get_unverified_header(token)
-        logger.info(f"[AUTH DIAGNOSTIC] JWT decoded header algorithm = {unverified_headers.get('alg', 'unknown')}")
+        alg = unverified_headers.get('alg', 'unknown')
+        kid = unverified_headers.get('kid', 'none')
+        typ = unverified_headers.get('typ', 'unknown')
         
-        # Decode payload safely to check standard claims before verification
-        unverified_claims = jwt.get_unverified_claims(token)
-        logger.info(f"[AUTH DIAGNOSTIC] JWT issuer = {unverified_claims.get('iss', 'unknown')}")
-        logger.info(f"[AUTH DIAGNOSTIC] JWT audience = {unverified_claims.get('aud', 'unknown')}")
-        logger.info(f"[AUTH DIAGNOSTIC] JWT subject/user ID = {unverified_claims.get('sub', 'unknown')}")
+        # User requested explicit EXACT safe diagnostics:
+        logger.info("AUTH PATH:")
+        logger.info(f"endpoint={request.url.path}")
+        logger.info(f"verifier={'SUPABASE_LEGACY_HS256' if alg == 'HS256' else 'SUPABASE_JWKS'}")
+        logger.info(f"algorithm={alg}")
         
-        # Verify the token using the Supabase JWKS (ES256)
-        jwks = get_jwks()
-        payload = jwt.decode(
-            token, 
-            jwks, 
-            algorithms=["ES256"],
-            options={"verify_aud": False}, # Default Supabase audience is 'authenticated'
-            issuer=f"{settings.SUPABASE_URL}/auth/v1"
-        )
+        logger.info("JWT HEADER:")
+        logger.info(f"alg={alg}")
+        logger.info(f"kid={kid}")
+        logger.info(f"typ={typ}")
+        
+        # Dynamic Verification Branching
+        if alg == 'HS256':
+            # CASE A: Legacy Project Configuration
+            payload = jwt.decode(
+                token, 
+                settings.SUPABASE_JWT_SECRET, 
+                algorithms=["HS256"],
+                options={"verify_aud": False}
+            )
+        elif alg in ['ES256', 'RS256']:
+            # CASE B: Modern JWKS Asymmetric Verification
+            jwks = get_jwks()
+            payload = jwt.decode(
+                token, 
+                jwks, 
+                algorithms=[alg],
+                options={"verify_aud": False},
+                issuer=f"{settings.SUPABASE_URL}/auth/v1"
+            )
+        else:
+            logger.warning(f"[AUTH DIAGNOSTIC] Unsupported algorithm: {alg}")
+            raise JWTError("Unsupported JWT algorithm")
+            
         user_id = payload.get("sub")
         if user_id is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication credentials: No sub claim",
             )
-        logger.info(f"[AUTH DIAGNOSTIC] token expiration status = VALID")
         return user_id
     except jwt.ExpiredSignatureError:
         logger.warning(f"[AUTH DIAGNOSTIC] token expiration status = EXPIRED")
