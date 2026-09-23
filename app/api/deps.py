@@ -9,12 +9,32 @@ security = HTTPBearer()
 def get_supabase_client() -> Client:
     return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
 
+import urllib.request
+import json
 import logging
 logger = logging.getLogger(__name__)
 
+_jwks = None
+
+def get_jwks():
+    global _jwks
+    if _jwks is None:
+        try:
+            jwks_url = f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+            req = urllib.request.Request(jwks_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                _jwks = json.loads(response.read())
+        except Exception as e:
+            logger.error(f"Failed to fetch JWKS: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to load authentication keys"
+            )
+    return _jwks
+
 def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
-    Validates the Supabase JWT securely on the backend using the JWT secret.
+    Validates the Supabase JWT securely on the backend using the JWKS public keys.
     Returns the user's UUID string.
     """
     token = credentials.credentials
@@ -32,12 +52,14 @@ def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(secu
         logger.info(f"[AUTH DIAGNOSTIC] JWT audience = {unverified_claims.get('aud', 'unknown')}")
         logger.info(f"[AUTH DIAGNOSTIC] JWT subject/user ID = {unverified_claims.get('sub', 'unknown')}")
         
-        # Supabase uses HS256 for its JWT tokens signed with the JWT Secret
+        # Verify the token using the Supabase JWKS (ES256)
+        jwks = get_jwks()
         payload = jwt.decode(
             token, 
-            settings.SUPABASE_JWT_SECRET, 
-            algorithms=["HS256"],
-            options={"verify_aud": False} # Default Supabase audience is 'authenticated'
+            jwks, 
+            algorithms=["ES256"],
+            options={"verify_aud": False}, # Default Supabase audience is 'authenticated'
+            issuer=f"{settings.SUPABASE_URL}/auth/v1"
         )
         user_id = payload.get("sub")
         if user_id is None:
