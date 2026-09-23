@@ -16,47 +16,25 @@ app.include_router(chat.router)
 
 @app.on_event("startup")
 async def startup_event():
-    import logging
     from app.core.config import settings
-    logger = logging.getLogger("startup_diagnostic")
     
-    logger.info("=== STARTUP DIAGNOSTIC ===")
-    
-    # 1. SUPABASE_URL Check
-    url = settings.SUPABASE_URL
-    if url:
-        hostname = url.split("//")[-1].split(".")[0]
-        logger.info(f"SUPABASE_URL project reference: {hostname}")
-    else:
-        logger.info("SUPABASE_URL present: false")
-        
-    # 2. SUPABASE_KEY Check
-    key = settings.SUPABASE_KEY
-    logger.info(f"SUPABASE_KEY present: {bool(key)}")
-    if key:
-        # Detect type safely: Service role keys usually contain 'service_role' or start with 'sb_secret'
-        if "service_role" in key or "sb_secret" in key:
-            logger.info("SUPABASE_KEY format/type: Service Role Key (detected)")
-        elif "anon" in key or "sb_anon" in key:
-            logger.info("SUPABASE_KEY format/type: Anon Key (detected)")
-        else:
-            logger.info("SUPABASE_KEY format/type: Unknown Format")
-            
-    # 3. SUPABASE_JWT_SECRET Check
-    secret = settings.SUPABASE_JWT_SECRET
-    logger.info(f"SUPABASE_JWT_SECRET present: {bool(secret)}")
-    
-    # 4. JWT verification algorithm
-    logger.info("JWT verification algorithm expected: HS256 (Legacy JWT Secret)")
-    
-    # 5. Pydantic Warning Check
+    # Check if pydantic fix is loaded
+    pydantic_loaded = False
     try:
         from app.schemas.ai import AIRequest
-        logger.info(f"AIRequest protected_namespaces override present: {hasattr(AIRequest, 'model_config') and 'protected_namespaces' in AIRequest.model_config}")
-    except Exception as e:
-        logger.info(f"Failed to inspect AIRequest: {e}")
-
-    logger.info("==========================")
+        pydantic_loaded = hasattr(AIRequest, 'model_config') and 'protected_namespaces' in AIRequest.model_config
+    except Exception:
+        pass
+        
+    print("=== STARTUP DIAGNOSTIC ===", flush=True)
+    print("COMMIT / SOURCE: 14f3059 (or latest)", flush=True)
+    print(f"SUPABASE_URL_CONFIGURED: {'true' if settings.SUPABASE_URL else 'false'}", flush=True)
+    print(f"SUPABASE_JWT_SECRET_CONFIGURED: {'true' if settings.SUPABASE_JWT_SECRET else 'false'}", flush=True)
+    print(f"SUPABASE_KEY_CONFIGURED: {'true' if settings.SUPABASE_KEY else 'false'}", flush=True)
+    print("JWT_ALGORITHM: HS256", flush=True)
+    print("DIAGNOSTIC_EXECUTED: true", flush=True)
+    print(f"PYDANTIC_FIX_LOADED: {'true' if pydantic_loaded else 'false'}", flush=True)
+    print("=== END STARTUP DIAGNOSTIC ===", flush=True)
 
 @app.get("/")
 def root():
