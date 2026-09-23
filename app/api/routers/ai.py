@@ -114,7 +114,7 @@ CRITICAL RULES:
         user_prompt=user_prompt,
         temperature=0.3, # low temperature for factual consistency
         max_tokens=1024,
-        model_id="ob20b"
+        model_id=settings.NVIDIA_MODEL
     )
 
     try:

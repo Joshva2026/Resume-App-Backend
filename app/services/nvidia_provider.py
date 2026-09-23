@@ -45,9 +45,7 @@ class NvidiaAIProvider(AIProvider):
         messages.append({"role": "user", "content": request.user_prompt})
         
         actual_model = request.model_id if request.model_id else self.model
-        if actual_model == "ob20b":
-            actual_model = "meta/llama-3.1-8b-instruct"
-            
+        
         payload = {
             "model": actual_model,
             "messages": messages,

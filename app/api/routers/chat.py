@@ -6,6 +6,7 @@ from app.api.deps import get_current_user_id, get_supabase_client
 from app.api.routers.ai import check_rate_limit, get_ai_provider
 from app.services.ai_provider import AIProvider
 from app.schemas.ai import AIRequest
+from app.core.config import settings
 import uuid
 
 router = APIRouter(prefix="/ai", tags=["chat"])
@@ -96,7 +97,7 @@ async def chat(
     if not chat_req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
         
-    model_id = chat_req.model_id if chat_req.model_id else "ob20b"
+    model_id = chat_req.model_id if chat_req.model_id else settings.NVIDIA_MODEL
     conversation_id = chat_req.conversation_id
     
     history_messages = []

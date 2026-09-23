@@ -23,11 +23,11 @@ async def parse_resume(
     check_rate_limit(request.client.host if request.client else "unknown")
     
     if file.content_type not in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are currently supported")
+        raise HTTPException(status_code=422, detail="Only PDF and DOCX files are currently supported")
         
     contents = await file.read()
     if len(contents) > 5 * 1024 * 1024: # 5MB limit
-        raise HTTPException(status_code=400, detail="File too large")
+        raise HTTPException(status_code=422, detail="File too large")
         
     parser = AtsParser()
     try:
@@ -38,7 +38,7 @@ async def parse_resume(
             
         structured_data = parser.structure_text(raw_text)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse document: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Failed to parse document: {str(e)}")
         
     # Persist to Supabase
     try:
@@ -83,7 +83,7 @@ async def analyze_resume(
     sanitized_text = scorer.sanitize_for_scoring(parsed_structure)
     
     if len(sanitized_text) < 50:
-        raise HTTPException(status_code=400, detail="Document contains insufficient content for analysis")
+        raise HTTPException(status_code=422, detail="Document contains insufficient content for analysis")
         
     # 2. Deterministic Scoring
     score_result = scorer.calculate_score(sanitized_text, analyze_req.job_description)

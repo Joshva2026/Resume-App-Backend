@@ -35,8 +35,7 @@ CRITICAL RULES:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.2,
-            max_tokens=1024,
-            model_id="ob20b"
+            max_tokens=1024
         )
         
         response = await self.provider.generate(req)
