@@ -48,9 +48,8 @@ class NvidiaAIProvider(AIProvider):
             
         messages.append({"role": "user", "content": final_prompt})
         
-        # Hard requirement: must be GPT-OSS-20B if specified or fallback to configured model, but NOT a local/gemini mock.
-        # Ensure it doesn't silently fallback to anything else.
-        actual_model = request.model_id if request.model_id else self.model
+        # Hard requirement: must be openai/gpt-oss-20b
+        actual_model = "openai/gpt-oss-20b"
         
         payload = {
             "model": actual_model,
