@@ -44,6 +44,8 @@ class NvidiaAIProvider(AIProvider):
             
         messages.append({"role": "user", "content": request.user_prompt})
         
+        # Hard requirement: must be GPT-OSS-20B if specified or fallback to configured model, but NOT a local/gemini mock.
+        # Ensure it doesn't silently fallback to anything else.
         actual_model = request.model_id if request.model_id else self.model
         
         payload = {
@@ -53,18 +55,40 @@ class NvidiaAIProvider(AIProvider):
             "max_tokens": request.max_tokens,
         }
         
-        # Bounded retries (3 attempts)
         max_retries = 3
         base_delay = 1.0
         
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for attempt in range(max_retries):
+        # Explicit connection vs read timeouts
+        # Connect timeout: 5 seconds. Read timeout (generation): 45 seconds.
+        timeout_config = httpx.Timeout(45.0, connect=5.0)
+        
+        # Payload size diagnostic
+        payload_chars = sum(len(m.get("content", "")) for m in messages)
+        
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
+            for attempt in range(1, max_retries + 1):
                 try:
+                    logger.info("=== NVIDIA ATS DIAGNOSTIC ===")
+                    logger.info("provider=nvidia")
+                    host = self.base_url.split("://")[-1].split("/")[0] if "://" in self.base_url else self.base_url
+                    logger.info(f"endpoint_host={host}")
+                    logger.info(f"model={actual_model}")
+                    logger.info(f"api_key_configured={bool(self.api_key)}")
+                    logger.info(f"connect_timeout=5.0")
+                    logger.info(f"read_timeout=45.0")
+                    logger.info(f"max_tokens={request.max_tokens}")
+                    logger.info(f"payload_chars={payload_chars}")
+                    logger.info(f"attempt={attempt}")
+
+                    clean_base_url = self.base_url.rstrip('/')
                     response = await client.post(
-                        f"{self.base_url}/chat/completions",
+                        f"{clean_base_url}/chat/completions",
                         json=payload,
                         headers=headers
                     )
+                    
+                    logger.info(f"result=SUCCESS")
+                    logger.info(f"status_code={response.status_code}")
                     
                     self._handle_http_errors(response)
                     
@@ -72,21 +96,24 @@ class NvidiaAIProvider(AIProvider):
                     return self._parse_response(data)
                     
                 except httpx.TimeoutException:
-                    if attempt == max_retries - 1:
+                    logger.info(f"result=TIMEOUT")
+                    if attempt == max_retries:
                         logger.error(f"NVIDIA API timeout after {max_retries} attempts")
                         raise ProviderTimeoutError("AI request timed out")
                 except (ProviderUnavailableError, RateLimitError) as e:
-                    if attempt == max_retries - 1:
+                    logger.info(f"result=HTTP_ERROR")
+                    if attempt == max_retries:
                         raise e
                 except Exception as e:
                     if isinstance(e, AIException):
                         raise e # Don't retry auth errors, invalid requests, etc
+                    logger.info(f"result=HTTP_ERROR")
                     logger.error(f"Unexpected NVIDIA error: {str(e)}")
-                    if attempt == max_retries - 1:
+                    if attempt == max_retries:
                         raise ProviderUnavailableError("Unexpected error communicating with AI provider")
                         
-                # Backoff before retry
-                await asyncio.sleep(base_delay * (2 ** attempt))
+                # Bounded exponential backoff before retry (e.g. 1s, 2s, 4s)
+                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
 
         raise ProviderUnavailableError("Failed to communicate with AI provider")
 
@@ -98,9 +125,12 @@ class NvidiaAIProvider(AIProvider):
         if status == 401 or status == 403:
             logger.error("NVIDIA API authentication failed")
             raise ProviderAuthenticationError("AI provider authentication failed")
+        elif status == 404:
+            logger.error("NVIDIA API endpoint or model not found (404)")
+            raise InvalidRequestError("AI provider endpoint or model not found")
         elif status == 429:
             raise RateLimitError("AI provider rate limit exceeded")
-        elif status == 400:
+        elif status == 400 or status == 422:
             logger.error(f"NVIDIA API invalid request: {response.text}")
             raise InvalidRequestError("Invalid request to AI provider")
         elif status >= 500:

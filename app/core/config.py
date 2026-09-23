@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     # NVIDIA Config
     NVIDIA_API_KEY: Optional[str] = None
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
-    NVIDIA_MODEL: str = "GPT-OSS-20B"
+    NVIDIA_MODEL: str = "openai/gpt-oss-20b"
     
     # AI Limits
     AI_RATE_LIMIT_PER_MINUTE: int = 10

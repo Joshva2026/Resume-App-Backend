@@ -80,6 +80,44 @@ async def test_ai_provider(
         # Fallback for unexpected errors
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@router.post("/test-provider")
+async def test_provider_connectivity(
+    request: Request,
+    provider: AIProvider = Depends(get_ai_provider)
+):
+    """
+    Isolated connectivity test for the NVIDIA provider.
+    Bypasses DB and parsing to test just the provider connection, auth, and model config.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(client_ip)
+    
+    ai_req = AIRequest(
+        system_prompt="Return the word OK.",
+        user_prompt="Return the word OK.",
+        temperature=0.1,
+        max_tokens=10,
+        model_id=settings.NVIDIA_MODEL
+    )
+    
+    try:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("=== NVIDIA CONNECTIVITY TEST ===")
+        logger.info(f"endpoint={settings.NVIDIA_BASE_URL}")
+        logger.info(f"model={settings.NVIDIA_MODEL}")
+        
+        response = await provider.generate(ai_req)
+        
+        logger.info("result=SUCCESS")
+        return {"status": "success", "content": response.content, "model": response.model}
+    except Exception as e:
+        logger.info("result=FAIL")
+        logger.info(f"error_type={e.__class__.__name__}")
+        logger.error(f"Test provider failed: {str(e)}")
+        # Raise explicitly so the caller sees the error type
+        raise HTTPException(status_code=500, detail=f"Connectivity test failed: {e.__class__.__name__} - {str(e)}")
+
 @router.post("/resume/polish", response_model=ResumePolishResponse)
 async def polish_resume_section(
     request: Request,

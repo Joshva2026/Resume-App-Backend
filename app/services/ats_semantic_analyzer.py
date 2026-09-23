@@ -1,6 +1,6 @@
 import json
 from typing import Dict, Any, List
-from app.services.ai_provider import AIProvider
+from app.services.ai_provider import AIProvider, ProviderTimeoutError, ProviderUnavailableError
 from app.schemas.ai import AIRequest
 
 class AtsSemanticAnalyzer:
@@ -38,9 +38,9 @@ CRITICAL RULES:
             max_tokens=1024
         )
         
-        response = await self.provider.generate(req)
-        
         try:
+            response = await self.provider.generate(req)
+            
             content = response.content.strip()
             if content.startswith("```json"):
                 content = content[7:-3].strip()
@@ -54,6 +54,9 @@ CRITICAL RULES:
                 "recommendations": parsed.get("recommendations", []),
                 "strengths": parsed.get("strengths", [])
             }
+        except (ProviderTimeoutError, ProviderUnavailableError):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=503, detail="AI provider temporarily unavailable")
         except Exception:
             return {
                 "missing_keywords": [],
