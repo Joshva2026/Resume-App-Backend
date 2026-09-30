@@ -91,7 +91,11 @@ async def analyze_resume(
     # 3. AI Semantic Analysis
     provider = NvidiaAIProvider()
     analyzer = AtsSemanticAnalyzer(provider)
-    semantic_result = await analyzer.analyze(sanitized_text, analyze_req.job_description)
+    semantic_result = await analyzer.analyze(
+        sanitized_text, 
+        analyze_req.job_description,
+        analyze_req.target_role
+    )
     
     report = AtsReport(
         ats_document_id=analyze_req.document_id,

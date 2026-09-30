@@ -7,7 +7,7 @@ class AtsSemanticAnalyzer:
     def __init__(self, provider: AIProvider):
         self.provider = provider
         
-    async def analyze(self, sanitized_text: str, jd: str = None) -> Dict[str, Any]:
+    async def analyze(self, sanitized_text: str, jd: str = None, target_role: str = None) -> Dict[str, Any]:
         """
         Queries AI for semantic feedback. 
         MUST NOT hallucinate facts, metrics, or alter the score.
@@ -38,6 +38,8 @@ Recommendation: maximum 160 characters
 7. Recommendations must answer WHAT to change and WHERE to change it (e.g., "Add Docker under Skills if you have used it.").
 """
         user_prompt = f"--- START UNTRUSTED RESUME TEXT ---\n{sanitized_text}\n--- END UNTRUSTED RESUME TEXT ---"
+        if target_role and target_role.strip():
+            user_prompt += f"\n\n--- TARGET ROLE ---\n{target_role}\n--- END TARGET ROLE ---"
         if jd and jd.strip():
             user_prompt += f"\n\n--- START UNTRUSTED JOB DESCRIPTION ---\n{jd}\n--- END UNTRUSTED JOB DESCRIPTION ---"
 
@@ -102,8 +104,8 @@ Recommendation: maximum 160 characters
                     "strengths": []
                 }
 
-            # If no JD, force missing keywords to empty
-            if not jd or not jd.strip():
+            # If no JD and no target role, force missing keywords to empty
+            if (not jd or not jd.strip()) and (not target_role or not target_role.strip()):
                 matched = parsed.get("matched_keywords", [])
                 missing = []
             else:
