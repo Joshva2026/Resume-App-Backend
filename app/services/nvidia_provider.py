@@ -27,11 +27,12 @@ class NvidiaAIProvider(AIProvider):
             logger.warning("NVIDIA_API_KEY is not configured.")
             
     async def generate(self, request: AIRequest) -> AIResponse:
-        if not self.api_key:
+        api_key = self.api_key.strip() if self.api_key else None
+        if not api_key:
             raise ProviderUnavailableError("AI Provider is not configured")
             
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
@@ -56,6 +57,7 @@ class NvidiaAIProvider(AIProvider):
             "messages": messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
+            "reasoning_effort": "high"
         }
         
         max_retries = 2
@@ -76,7 +78,8 @@ class NvidiaAIProvider(AIProvider):
                     host = self.base_url.split("://")[-1].split("/")[0] if "://" in self.base_url else self.base_url
                     logger.info(f"endpoint_host={host}")
                     logger.info(f"model={actual_model}")
-                    logger.info(f"api_key_configured={bool(self.api_key)}")
+                    logger.info(f"api_key_configured={bool(api_key)}")
+                    logger.info(f"api_key_length={len(api_key) if api_key else 0}")
                     logger.info(f"connect_timeout=5.0")
                     logger.info(f"read_timeout=120.0")
                     logger.info(f"max_tokens={request.max_tokens}")
@@ -90,7 +93,7 @@ class NvidiaAIProvider(AIProvider):
                         headers=headers
                     )
                     
-                    self._handle_http_errors(response)
+                    self._handle_http_errors(response, actual_model, self.base_url)
                     
                     data = response.json()
                     
@@ -127,13 +130,19 @@ class NvidiaAIProvider(AIProvider):
 
         raise ProviderUnavailableError("Failed to communicate with AI provider")
 
-    def _handle_http_errors(self, response: httpx.Response):
+    def _handle_http_errors(self, response: httpx.Response, actual_model: str, base_url: str):
         status = response.status_code
         if status == 200:
             return
             
+        host = base_url.split("://")[-1].split("/")[0] if "://" in base_url else base_url
+        logger.error(f"HTTP_FAILURE status={status} model={actual_model} host={host}")
+        
+        # Sanitize response body to avoid leaking keys/tokens in case provider echoes them
+        sanitized_text = response.text.replace(self.api_key or "NO_KEY", "[REDACTED]")
+        
         if status == 401 or status == 403:
-            logger.error("NVIDIA API authentication failed")
+            logger.error(f"NVIDIA API authentication failed: {sanitized_text}")
             raise ProviderAuthenticationError("AI provider authentication failed")
         elif status == 404:
             logger.error("NVIDIA API endpoint or model not found (404)")
@@ -141,13 +150,13 @@ class NvidiaAIProvider(AIProvider):
         elif status == 429:
             raise RateLimitError("AI provider rate limit exceeded")
         elif status == 400 or status == 422:
-            logger.error(f"NVIDIA API invalid request: {response.text}")
+            logger.error(f"NVIDIA API invalid request: {sanitized_text}")
             raise InvalidRequestError("Invalid request to AI provider")
         elif status >= 500:
-            logger.error(f"NVIDIA API provider error {status}: {response.text}")
+            logger.error(f"NVIDIA API provider error {status}: {sanitized_text}")
             raise ProviderUnavailableError("AI provider is temporarily unavailable")
         else:
-            logger.error(f"NVIDIA API unexpected status {status}: {response.text}")
+            logger.error(f"NVIDIA API unexpected status {status}: {sanitized_text}")
             raise AIException(f"AI provider returned status {status}")
 
     def _parse_response(self, data: dict) -> AIResponse:
@@ -159,6 +168,10 @@ class NvidiaAIProvider(AIProvider):
             content = choices[0].get("message", {}).get("content")
             if not content:
                 raise MalformedResponseError("No content in provider response")
+            
+            # Remove <think>...</think> reasoning blocks if present
+            import re
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
                 
             finish_reason = choices[0].get("finish_reason")
             

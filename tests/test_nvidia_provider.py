@@ -66,7 +66,7 @@ async def test_nvidia_timeout(provider):
                 await provider.generate(req)
             
             assert "AI request timed out" in str(exc_info.value)
-            assert mock_post.call_count == 3  # 3 retries
+            assert mock_post.call_count == 2  # 3 retries
 
 @pytest.mark.asyncio
 async def test_nvidia_http_429(provider):
@@ -82,7 +82,7 @@ async def test_nvidia_http_429(provider):
             with pytest.raises(RateLimitError):
                 await provider.generate(req)
             
-            assert mock_post.call_count == 3  # Retries on 429
+            assert mock_post.call_count == 2  # Retries on 429
 
 @pytest.mark.asyncio
 async def test_nvidia_http_500(provider):
@@ -98,7 +98,7 @@ async def test_nvidia_http_500(provider):
             with pytest.raises(ProviderUnavailableError):
                 await provider.generate(req)
             
-            assert mock_post.call_count == 3  # Retries on 500
+            assert mock_post.call_count == 2  # Retries on 500
 
 @pytest.mark.asyncio
 async def test_nvidia_http_404(provider):

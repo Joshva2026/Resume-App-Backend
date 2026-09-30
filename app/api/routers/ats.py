@@ -103,7 +103,9 @@ async def analyze_resume(
             "missing": semantic_result["missing_keywords"]
         },
         recommendations=semantic_result["recommendations"],
-        strengths=semantic_result["strengths"]
+        strengths=semantic_result["strengths"],
+        semantic_analysis_available=semantic_result.get("semantic_analysis_available", True),
+        semantic_error=semantic_result.get("semantic_error")
     )
     
     # Persist report

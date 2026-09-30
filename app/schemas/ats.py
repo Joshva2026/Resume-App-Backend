@@ -19,3 +19,5 @@ class AtsReport(BaseModel):
     keyword_analysis: Dict[str, List[str]]
     recommendations: List[str]
     strengths: List[str]
+    semantic_analysis_available: bool = True
+    semantic_error: Optional[str] = None
