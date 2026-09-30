@@ -42,22 +42,32 @@ CRITICAL RULES:
             response = await self.provider.generate(req)
             
             content = response.content.strip()
-            if content.startswith("```json"):
-                content = content[7:-3].strip()
-            elif content.startswith("```"):
-                content = content[3:-3].strip()
+            
+            # Robust JSON extraction
+            import re
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                content = json_match.group(0)
                 
             parsed = json.loads(content)
             return {
-                "missing_keywords": parsed.get("missing_keywords", []),
-                "matched_keywords": parsed.get("matched_keywords", []),
+                "missing_keywords": parsed.get("missing_keywords", []) if jd else [],
+                "matched_keywords": parsed.get("matched_keywords", []) if jd else [],
                 "recommendations": parsed.get("recommendations", []),
                 "strengths": parsed.get("strengths", [])
             }
-        except (ProviderTimeoutError, ProviderUnavailableError):
-            from fastapi import HTTPException
-            raise HTTPException(status_code=503, detail="AI provider temporarily unavailable")
-        except Exception:
+        except (ProviderTimeoutError, ProviderUnavailableError) as e:
+            import logging
+            logging.error(f"ATS AI Provider Error: {str(e)}")
+            return {
+                "missing_keywords": [],
+                "matched_keywords": [],
+                "recommendations": ["AI provider temporarily unavailable. Please try again later."],
+                "strengths": []
+            }
+        except Exception as e:
+            import logging
+            logging.error(f"ATS AI Parsing/Unknown Error: {str(e)} | Content: {locals().get('content', 'No content')}")
             return {
                 "missing_keywords": [],
                 "matched_keywords": [],

@@ -162,10 +162,11 @@ CRITICAL RULES:
         try:
             # Strip potential markdown blocks if model misbehaves
             content = response.content.strip()
-            if content.startswith("```json"):
-                content = content[7:-3].strip()
-            elif content.startswith("```"):
-                content = content[3:-3].strip()
+            
+            import re
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                content = json_match.group(0)
                 
             parsed = json.loads(content)
             
