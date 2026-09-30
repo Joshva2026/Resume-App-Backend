@@ -57,7 +57,7 @@ class NvidiaAIProvider(AIProvider):
             "messages": messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
-            "reasoning_effort": "high"
+            "reasoning_effort": "low"
         }
         
         max_retries = 2
@@ -86,12 +86,30 @@ class NvidiaAIProvider(AIProvider):
                     logger.info(f"payload_chars={payload_chars}")
                     logger.info(f"attempt={attempt}")
 
+                    logger.info("AI request started")
+                    logger.info("AI provider request started")
+                    logger.info("AI_PROVIDER_START")
+                    
+                    import time
+                    start_time = time.time()
+                    
                     clean_base_url = self.base_url.rstrip('/')
                     response = await client.post(
                         f"{clean_base_url}/chat/completions",
                         json=payload,
                         headers=headers
                     )
+                    
+                    duration_ms = int((time.time() - start_time) * 1000)
+                    logger.info("AI provider response received")
+                    logger.info(f"AI provider duration: {duration_ms}ms")
+                    logger.info(f"AI response status: {response.status_code}")
+                    logger.info(f"AI response content length: {len(response.text)}")
+                    logger.info("AI request completed")
+                    
+                    logger.info(f"AI_PROVIDER_RESPONSE status={response.status_code} duration={duration_ms}ms")
+                    logger.info(f"AI_PROVIDER_CONTENT length={len(response.text)}")
+                    logger.info("AI_PROVIDER_END")
                     
                     self._handle_http_errors(response, actual_model, self.base_url)
                     
@@ -109,6 +127,8 @@ class NvidiaAIProvider(AIProvider):
                     return self._parse_response(data)
                     
                 except httpx.TimeoutException:
+                    duration_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
+                    logger.info(f"AI_PROVIDER_TIMEOUT duration={duration_ms}ms")
                     logger.info(f"result=TIMEOUT")
                     if attempt == max_retries:
                         logger.error(f"NVIDIA API timeout after {max_retries} attempts")

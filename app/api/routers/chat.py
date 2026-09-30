@@ -195,8 +195,20 @@ async def chat(
             message=assistant_content,
             model_id=response.model
         )
+    except ProviderAuthenticationError:
+        raise HTTPException(status_code=500, detail="AI Provider configuration error")
+    except ProviderUnavailableError:
+        raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
+    except ProviderTimeoutError:
+        raise HTTPException(status_code=504, detail="AI request timed out")
+    except RateLimitError:
+        raise HTTPException(status_code=429, detail="AI provider rate limit exceeded")
+    except InvalidRequestError:
+        raise HTTPException(status_code=400, detail="Invalid request to AI service")
+    except MalformedResponseError:
+        raise HTTPException(status_code=502, detail="Bad response from AI service")
+    except AIException:
+        raise HTTPException(status_code=500, detail="An error occurred processing the AI request")
     except Exception as e:
-        # Log the actual error for debugging
         logger.error(f"AI Assistant Error: {str(e)}")
-        # User message was persisted, which is good (allows retry). We raise safe error.
         raise HTTPException(status_code=500, detail="AI Assistant is temporarily unavailable. Please try again.")
