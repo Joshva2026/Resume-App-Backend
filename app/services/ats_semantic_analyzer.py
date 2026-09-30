@@ -35,7 +35,7 @@ CRITICAL RULES:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.2,
-            max_tokens=1024
+            max_tokens=2048
         )
         
         try:

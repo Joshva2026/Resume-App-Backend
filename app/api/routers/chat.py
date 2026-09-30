@@ -8,6 +8,9 @@ from app.services.ai_provider import AIProvider
 from app.schemas.ai import AIRequest
 from app.core.config import settings
 import uuid
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai", tags=["chat"])
 
@@ -119,16 +122,22 @@ async def chat(
         if not conv_check.data:
             raise HTTPException(status_code=404, detail="Conversation not found")
             
-        # Fetch bounded context (last 20 messages to save tokens)
+        # Fetch bounded context (last 10 messages to save tokens and prevent huge payload)
         msg_res = supabase.table("ai_messages")\
             .select("role, content")\
             .eq("conversation_id", conversation_id)\
             .order("created_at", desc=True)\
-            .limit(20)\
+            .limit(10)\
             .execute()
         
-        # Reverse to chronological order
-        history_messages = [{"role": m["role"], "content": m["content"]} for m in reversed(msg_res.data)]
+        # Reverse to chronological order and optionally truncate very long past messages
+        # to ensure we don't blow up the provider payload if previous outputs were massive
+        raw_history = list(reversed(msg_res.data))
+        for m in raw_history:
+            content = m["content"]
+            if len(content) > 3000:
+                content = content[:3000] + "\n...[truncated for length]"
+            history_messages.append({"role": m["role"], "content": content})
         
     # 2. Persist User Message
     supabase.table("ai_messages").insert({
@@ -180,5 +189,7 @@ async def chat(
             model_id=response.model
         )
     except Exception as e:
-        # User message was persisted, which is good (allows retry). We raise error.
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log the actual error for debugging
+        logger.error(f"AI Assistant Error: {str(e)}")
+        # User message was persisted, which is good (allows retry). We raise safe error.
+        raise HTTPException(status_code=500, detail="AI Assistant is temporarily unavailable. Please try again.")

@@ -58,12 +58,12 @@ class NvidiaAIProvider(AIProvider):
             "max_tokens": request.max_tokens,
         }
         
-        max_retries = 3
+        max_retries = 2
         base_delay = 1.0
         
         # Explicit connection vs read timeouts
-        # Connect timeout: 5 seconds. Read timeout (generation): 45 seconds.
-        timeout_config = httpx.Timeout(45.0, connect=5.0)
+        # Connect timeout: 5 seconds. Read timeout (generation): 120 seconds.
+        timeout_config = httpx.Timeout(120.0, connect=5.0)
         
         # Payload size diagnostic
         payload_chars = sum(len(m.get("content", "")) for m in messages)
@@ -71,14 +71,14 @@ class NvidiaAIProvider(AIProvider):
         async with httpx.AsyncClient(timeout=timeout_config) as client:
             for attempt in range(1, max_retries + 1):
                 try:
-                    logger.info("=== NVIDIA ATS DIAGNOSTIC ===")
+                    logger.info("=== NVIDIA DIAGNOSTIC ===")
                     logger.info("provider=nvidia")
                     host = self.base_url.split("://")[-1].split("/")[0] if "://" in self.base_url else self.base_url
                     logger.info(f"endpoint_host={host}")
                     logger.info(f"model={actual_model}")
                     logger.info(f"api_key_configured={bool(self.api_key)}")
                     logger.info(f"connect_timeout=5.0")
-                    logger.info(f"read_timeout=45.0")
+                    logger.info(f"read_timeout=120.0")
                     logger.info(f"max_tokens={request.max_tokens}")
                     logger.info(f"payload_chars={payload_chars}")
                     logger.info(f"attempt={attempt}")
@@ -90,12 +90,19 @@ class NvidiaAIProvider(AIProvider):
                         headers=headers
                     )
                     
-                    logger.info(f"result=SUCCESS")
-                    logger.info(f"status_code={response.status_code}")
-                    
                     self._handle_http_errors(response)
                     
                     data = response.json()
+                    
+                    # Log token usage or finish reason if it's truncated
+                    choices = data.get("choices", [])
+                    if choices:
+                        finish_reason = choices[0].get("finish_reason")
+                        if finish_reason == "length":
+                            logger.warning("NVIDIA response truncated due to length/max_tokens.")
+                            
+                    logger.info(f"result=SUCCESS")
+                    logger.info(f"status_code={response.status_code}")
                     return self._parse_response(data)
                     
                 except httpx.TimeoutException:
@@ -115,7 +122,7 @@ class NvidiaAIProvider(AIProvider):
                     if attempt == max_retries:
                         raise ProviderUnavailableError("Unexpected error communicating with AI provider")
                         
-                # Bounded exponential backoff before retry (e.g. 1s, 2s, 4s)
+                # Bounded exponential backoff before retry
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
 
         raise ProviderUnavailableError("Failed to communicate with AI provider")
@@ -137,6 +144,7 @@ class NvidiaAIProvider(AIProvider):
             logger.error(f"NVIDIA API invalid request: {response.text}")
             raise InvalidRequestError("Invalid request to AI provider")
         elif status >= 500:
+            logger.error(f"NVIDIA API provider error {status}: {response.text}")
             raise ProviderUnavailableError("AI provider is temporarily unavailable")
         else:
             logger.error(f"NVIDIA API unexpected status {status}: {response.text}")
