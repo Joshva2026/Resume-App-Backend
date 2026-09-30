@@ -6,7 +6,13 @@ class AtsScorer:
         """
         Extracts only the body text for scoring, explicitly dropping 'personal_info'.
         """
-        return parsed_structure.get("body", "")
+        # Collect all parts except personal_info
+        body_parts = []
+        for key, value in parsed_structure.items():
+            if key != "personal_info" and isinstance(value, str):
+                body_parts.append(value)
+        
+        return "\n".join(body_parts)
 
     def calculate_score(self, text: str, jd: str = None, target_role: str = None) -> Dict[str, Any]:
         """

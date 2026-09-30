@@ -2,12 +2,13 @@ from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from app.core.config import settings
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 security = HTTPBearer()
 
-def get_supabase_client() -> Client:
-    return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+def get_supabase_client(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Client:
+    options = ClientOptions(headers={"Authorization": f"Bearer {credentials.credentials}"})
+    return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY, options=options)
 
 import urllib.request
 import json

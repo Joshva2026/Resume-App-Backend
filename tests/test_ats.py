@@ -8,12 +8,16 @@ def test_pii_does_not_affect_score():
     # Same body, different PII
     resume_a = {
         "personal_info": ["John Doe", "john.doe@example.com", "555-0100"],
-        "body": "Experience: Developed Python backend using FastAPI. Skills: Python, SQL. Education: BS Computer Science."
+        "experience": "Developed Python backend using FastAPI.",
+        "skills": "Python, SQL.",
+        "education": "BS Computer Science."
     }
     
     resume_b = {
         "personal_info": ["Jane Smith", "jane.smith@another.com", "999-9999", "linkedin.com/in/jane"],
-        "body": "Experience: Developed Python backend using FastAPI. Skills: Python, SQL. Education: BS Computer Science."
+        "experience": "Developed Python backend using FastAPI.",
+        "skills": "Python, SQL.",
+        "education": "BS Computer Science."
     }
     
     text_a = scorer.sanitize_for_scoring(resume_a)
@@ -35,5 +39,4 @@ def test_docx_and_pdf_produce_normalized_structure():
     
     assert "John Doe" in structured["personal_info"]
     assert "john@example.com" in structured["personal_info"]
-    assert "Experience" in structured["body"]
-    assert "Developed app" in structured["body"]
+    assert "Developed app" in structured["experience"]

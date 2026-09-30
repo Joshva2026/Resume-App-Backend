@@ -1,4 +1,4 @@
-import PyPDF2
+import pypdf
 from docx import Document
 from io import BytesIO
 from typing import Dict, Any
@@ -6,7 +6,7 @@ import re
 
 class AtsParser:
     def parse_pdf(self, file_bytes: bytes) -> str:
-        pdf = PyPDF2.PdfReader(BytesIO(file_bytes))
+        pdf = pypdf.PdfReader(BytesIO(file_bytes))
         text = ""
         for page in pdf.pages:
             extracted = page.extract_text()
@@ -28,31 +28,53 @@ class AtsParser:
 
     def structure_text(self, text: str) -> Dict[str, Any]:
         """
-        Naive structure extraction to support UI Preview.
+        Extract sections using keyword matching.
         """
         lines = text.split("\n")
-        pii = []
-        body = []
         
-        email_pattern = re.compile(r"[\w\.-]+@[\w\.-]+")
-        phone_pattern = re.compile(r"\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}")
-        url_pattern = re.compile(r"https?://|www\.|linkedin\.com/|github\.com/")
+        sections = {
+            "personal_info": [],
+            "summary": [],
+            "experience": [],
+            "education": [],
+            "skills": [],
+            "projects": [],
+            "certifications": [],
+            "other": []
+        }
+        
+        current_section = "personal_info"
+        
+        section_keywords = {
+            "summary": ["summary", "profile", "objective", "about me"],
+            "experience": ["experience", "employment", "work history", "professional experience"],
+            "education": ["education", "academic background", "academic history"],
+            "skills": ["skills", "technical skills", "core competencies", "technologies"],
+            "projects": ["projects", "personal projects", "academic projects"],
+            "certifications": ["certifications", "licenses", "courses"]
+        }
         
         for i, line in enumerate(lines):
             line_clean = line.strip()
             if not line_clean:
                 continue
                 
-            # Assume first 10 lines contain PII if they have emails/phones/URLs or are very short
-            if i < 15 and (email_pattern.search(line_clean) or phone_pattern.search(line_clean) or url_pattern.search(line_clean)):
-                pii.append(line_clean)
-            elif i < 3 and len(line_clean.split()) <= 5:
-                # Likely Name
-                pii.append(line_clean)
-            else:
-                body.append(line_clean)
+            line_lower = line_clean.lower()
+            
+            # Identify section headers
+            is_header = False
+            if len(line_clean.split()) <= 4:
+                for sec, keywords in section_keywords.items():
+                    if any(kw == line_lower for kw in keywords) or any(line_lower.startswith(kw) for kw in keywords):
+                        current_section = sec
+                        is_header = True
+                        break
+            
+            if not is_header:
+                # If we are in personal info and we exceed 15 lines, maybe default to "other" if not identified
+                if current_section == "personal_info" and i > 15:
+                    current_section = "other"
+                sections[current_section].append(line_clean)
                 
-        return {
-            "personal_info": pii,
-            "body": "\n".join(body)
-        }
+        # Join sections back to strings
+        return {k: "\n".join(v) for k, v in sections.items()}
