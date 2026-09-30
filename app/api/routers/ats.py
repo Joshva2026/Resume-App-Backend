@@ -86,7 +86,7 @@ async def analyze_resume(
         raise HTTPException(status_code=422, detail="Document contains insufficient content for analysis")
         
     # 2. Deterministic Scoring
-    score_result = scorer.calculate_score(sanitized_text, analyze_req.job_description)
+    score_result = scorer.calculate_score(sanitized_text, analyze_req.job_description, analyze_req.target_role)
     
     # 3. AI Semantic Analysis
     provider = NvidiaAIProvider()

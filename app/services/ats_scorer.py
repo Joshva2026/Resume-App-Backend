@@ -73,7 +73,7 @@ class AtsScorer:
             section_scores["Target Role"] = role_score
             score += role_score * 0.10
         else:
-            section_scores["Target Role"] = "Not Performed"
+            section_scores["Target Role"] = None
         
         # 8. JD Semantic Match (10%)
         if jd:
@@ -84,7 +84,7 @@ class AtsScorer:
             section_scores["JD Match"] = jd_score
             score += jd_score * 0.10
         else:
-            section_scores["JD Match"] = "Not Performed"
+            section_scores["JD Match"] = None
             
         # 9. ATS Readability / Structure (5%)
         # Checks if length is reasonable (not too short, not a giant block of unbroken text)

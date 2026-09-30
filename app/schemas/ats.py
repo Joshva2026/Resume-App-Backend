@@ -15,7 +15,7 @@ class AtsReport(BaseModel):
     ats_document_id: str
     target_role: Optional[str]
     overall_score: int
-    section_scores: Dict[str, int]
+    section_scores: Dict[str, Optional[int]]
     keyword_analysis: Dict[str, List[str]]
     recommendations: List[str]
     strengths: List[str]

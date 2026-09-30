@@ -15,6 +15,7 @@ def test_chat_empty_message():
     assert response.status_code in [400, 401, 403]
 
 def test_conversations_unauthorized():
+    app.dependency_overrides.clear()
     # Should block without token
     response = client.get("/ai/conversations")
     assert response.status_code == 403 # HTTPBearer returns 403 if missing Authorization header
