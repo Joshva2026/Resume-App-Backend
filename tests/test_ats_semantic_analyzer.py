@@ -63,11 +63,14 @@ async def test_malformed_and_truncated_json():
     content = '{\n  "matched_keywords": [\n    "Python"' # Incomplete
     provider = MockProvider(content=content)
     analyzer = AtsSemanticAnalyzer(provider)
-    result = await analyzer.analyze("resume text", "jd text")
-    
+    result = await analyzer.analyze("Experience with Python and FastAPI", "Looking for Python and Docker")
+
     assert result["semantic_analysis_available"] is False
-    assert result["semantic_error"] == "AI recommendations are temporarily unavailable. Your ATS score is still available."
-    assert result["matched_keywords"] == []
+    assert result["analysis_mode"] == "deterministic_fallback"
+    assert "Displaying local deterministic keyword match" in result["semantic_error"]
+    assert "Python" in result["matched_keywords"]
+    assert "Docker" in result["missing_keywords"]
+    assert len(result["recommendations"]) > 0
 
 @pytest.mark.asyncio
 async def test_provider_truncation():
@@ -80,10 +83,13 @@ async def test_provider_truncation():
     }
     provider = MockProvider(content=json.dumps(mock_json), finish_reason="length")
     analyzer = AtsSemanticAnalyzer(provider)
-    result = await analyzer.analyze("resume text", "jd text")
-    
+    result = await analyzer.analyze("resume text with Python", "jd with Python and Kubernetes")
+
     assert result["semantic_analysis_available"] is False
-    assert result["semantic_error"] == "AI recommendations are temporarily unavailable. Your ATS score is still available."
+    assert result["analysis_mode"] == "deterministic_fallback"
+    assert "truncated" in result["semantic_error"]
+    assert "Python" in result["matched_keywords"]
+    assert "Kubernetes" in result["missing_keywords"]
 
 @pytest.mark.asyncio
 async def test_no_jd_mode():
@@ -125,10 +131,16 @@ async def test_array_and_string_limits():
 
 @pytest.mark.asyncio
 async def test_provider_timeout():
-    # 8. Provider timeout
-    provider = MockProvider(content="", raise_exception=ProviderTimeoutError("Timeout"))
+    # 8. Provider timeout triggers deterministic fallback
+    provider = MockProvider(content="", raise_exception=ProviderTimeoutError("The AI response took too long. Please try again."))
     analyzer = AtsSemanticAnalyzer(provider)
-    result = await analyzer.analyze("resume text", "jd text")
+    result = await analyzer.analyze("Experienced Software Engineer skilled in Python and SQL.", "We require Python, SQL, and Docker.")
     
     assert result["semantic_analysis_available"] is False
-    assert "temporarily unavailable" in result["semantic_error"]
+    assert result["analysis_mode"] == "deterministic_fallback"
+    assert "timed out or was temporarily unavailable" in result["semantic_error"]
+    assert "Python" in result["matched_keywords"]
+    assert "SQL" in result["matched_keywords"]
+    assert "Docker" in result["missing_keywords"]
+    assert len(result["recommendations"]) > 0
+    assert len(result["strengths"]) > 0

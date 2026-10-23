@@ -1,6 +1,7 @@
 import httpx
 import logging
 import asyncio
+import json
 from app.core.config import settings
 from app.schemas.ai import AIRequest, AIResponse, AIResponseUsage
 from app.services.ai_provider import (
@@ -20,10 +21,17 @@ class NvidiaAIProvider(AIProvider):
     _shared_client = None
 
     @classmethod
+    def get_effective_timeouts(cls) -> tuple[float, float]:
+        connect_timeout = float(getattr(settings, "AI_CONNECT_TIMEOUT_SECONDS", 10.0))
+        configured_read = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 70.0))
+        # Keep read timeout bounded between 5.0s and 80.0s to respect Render's 100s gateway deadline
+        read_timeout = max(5.0, min(configured_read, 80.0))
+        return connect_timeout, read_timeout
+
+    @classmethod
     def get_client(cls) -> httpx.AsyncClient:
+        connect_timeout, read_timeout = cls.get_effective_timeouts()
         if cls._shared_client is None or cls._shared_client.is_closed:
-            connect_timeout = float(getattr(settings, "AI_CONNECT_TIMEOUT_SECONDS", 5.0))
-            read_timeout = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 45.0))
             timeout_config = httpx.Timeout(
                 timeout=read_timeout,
                 connect=connect_timeout,
@@ -83,8 +91,14 @@ class NvidiaAIProvider(AIProvider):
         
         max_retries = 2
         base_delay = 1.0
-        connect_timeout = float(getattr(settings, "AI_CONNECT_TIMEOUT_SECONDS", 5.0))
-        read_timeout = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 40.0))
+        connect_timeout, read_timeout = self.get_effective_timeouts()
+        timeout_config = httpx.Timeout(
+            timeout=read_timeout,
+            connect=connect_timeout,
+            read=read_timeout,
+            write=10.0,
+            pool=5.0
+        )
         
         # Payload size diagnostic
         payload_chars = sum(len(m.get("content", "")) for m in messages)
@@ -116,7 +130,8 @@ class NvidiaAIProvider(AIProvider):
                     response = await client.post(
                         f"{clean_base_url}/chat/completions",
                         json=payload,
-                        headers=headers
+                        headers=headers,
+                        timeout=timeout_config
                     )
                     
                     duration_ms = int((time.time() - start_time) * 1000)
@@ -187,6 +202,93 @@ class NvidiaAIProvider(AIProvider):
                 await asyncio.sleep((base_delay * (2 ** (attempt - 1))) + jitter)
 
         raise ProviderUnavailableError("Failed to communicate with AI provider")
+
+    async def generate_stream(self, request: AIRequest):
+        api_key = self.api_key.strip() if self.api_key else None
+        if not api_key:
+            raise ProviderUnavailableError("AI Provider is not configured")
+            
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream"
+        }
+        
+        messages = []
+        if request.system_prompt:
+            messages.append({"role": "system", "content": request.system_prompt})
+            
+        for msg in request.history:
+            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+            
+        messages.append({"role": "user", "content": request.user_prompt})
+        actual_model = (request.model_id or self.model or getattr(settings, "NVIDIA_MODEL", "openai/gpt-oss-20b")).strip()
+        
+        payload = {
+            "model": actual_model,
+            "messages": messages,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+            "stream": True
+        }
+        
+        connect_timeout, read_timeout = self.get_effective_timeouts()
+        timeout_config = httpx.Timeout(
+            timeout=read_timeout,
+            connect=connect_timeout,
+            read=read_timeout,
+            write=10.0,
+            pool=5.0
+        )
+        
+        client = self.get_client()
+        clean_base_url = self.base_url.rstrip('/')
+        
+        try:
+            async with client.stream(
+                "POST",
+                f"{clean_base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=timeout_config
+            ) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    self._handle_http_errors(response, actual_model, self.base_url)
+                    
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            choices = chunk.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content") or ""
+                                if content:
+                                    yield content
+                        except Exception:
+                            continue
+        except httpx.ReadTimeout:
+            logger.warning(f"AI Provider streaming read timeout on {actual_model}")
+            raise ProviderTimeoutError("The AI response took too long. Please try again.")
+        except httpx.ConnectTimeout:
+            logger.warning(f"AI Provider streaming connect timeout on {actual_model}")
+            raise ProviderTimeoutError("Failed to connect to AI provider in time")
+        except httpx.ConnectError as e:
+            logger.warning(f"AI Provider streaming connection error: {e}")
+            raise ProviderUnavailableError("Unable to establish connection to AI provider")
+        except httpx.TimeoutException:
+            raise ProviderTimeoutError("The AI response took too long. Please try again.")
+        except Exception as e:
+            if isinstance(e, AIException):
+                raise e
+            logger.error(f"Unexpected streaming error: {str(e)}")
+            raise ProviderUnavailableError("Unexpected error communicating with AI provider")
 
     def _handle_http_errors(self, response: httpx.Response, actual_model: str, base_url: str):
         status = response.status_code

@@ -28,3 +28,8 @@ class AIProvider(ABC):
     async def generate(self, request: AIRequest) -> AIResponse:
         """Generate response from the AI provider"""
         pass
+
+    async def generate_stream(self, request: AIRequest):
+        """Generate streaming chunks from the AI provider (AsyncIterator[str])"""
+        resp = await self.generate(request)
+        yield resp.content

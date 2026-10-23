@@ -237,3 +237,62 @@ def test_no_fabricated_assistant_response_persisted_on_failure():
         inserted_payload = call_args[0][0] if call_args[0] else call_args[1]
         assert inserted_payload.get("role") != "assistant", "Fabricated assistant message was persisted!"
 
+def test_chat_stream_success():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-stream-1", msg_id="msg-stream-1")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_gen(req):
+        yield "Hello"
+        yield " there!"
+    mock_provider.generate_stream = mock_stream_gen
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Stream hello"})
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    lines = [line for line in response.text.split("\n") if line.startswith("data: ")]
+    assert len(lines) == 3 # chunk 1, chunk 2, done
+    
+    import json
+    chunk1 = json.loads(lines[0][6:])
+    assert chunk1["type"] == "chunk"
+    assert chunk1["content"] == "Hello"
+    
+    chunk2 = json.loads(lines[1][6:])
+    assert chunk2["type"] == "chunk"
+    assert chunk2["content"] == " there!"
+    
+    done = json.loads(lines[2][6:])
+    assert done["type"] == "done"
+    assert done["message"] == "Hello there!"
+    assert done["conversation_id"] == "conv-stream-1"
+
+def test_chat_stream_timeout_emits_error_and_rolls_back():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-stream-err", msg_id="msg-stream-err")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_timeout(req):
+        raise ProviderTimeoutError("The AI response took too long. Please try again.")
+        yield
+    mock_provider.generate_stream = mock_stream_timeout
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Timeout stream"})
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    lines = [line for line in response.text.split("\n") if line.startswith("data: ")]
+    assert len(lines) == 1
+    
+    import json
+    err = json.loads(lines[0][6:])
+    assert err["type"] == "error"
+    assert "The AI response took too long" in err["detail"]
+    
+    # Verify rollback happened
+    mock_sb.table("ai_messages").delete.assert_called()
+    mock_sb.table("ai_conversations").delete.assert_called()
+

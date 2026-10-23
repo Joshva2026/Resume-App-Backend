@@ -88,13 +88,14 @@ async def analyze_resume(
     # 2. Deterministic Scoring
     score_result = scorer.calculate_score(sanitized_text, analyze_req.job_description, analyze_req.target_role)
     
-    # 3. AI Semantic Analysis
+    # 3. AI Semantic Analysis (with deterministic fallback)
     provider = NvidiaAIProvider()
     analyzer = AtsSemanticAnalyzer(provider)
     semantic_result = await analyzer.analyze(
         sanitized_text, 
         analyze_req.job_description,
-        analyze_req.target_role
+        analyze_req.target_role,
+        section_scores=score_result["sections"]
     )
     
     report = AtsReport(
@@ -109,7 +110,8 @@ async def analyze_resume(
         recommendations=semantic_result["recommendations"],
         strengths=semantic_result["strengths"],
         semantic_analysis_available=semantic_result.get("semantic_analysis_available", True),
-        semantic_error=semantic_result.get("semantic_error")
+        semantic_error=semantic_result.get("semantic_error"),
+        analysis_mode=semantic_result.get("analysis_mode", "ai")
     )
     
     # Persist report

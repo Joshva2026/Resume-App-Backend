@@ -77,3 +77,54 @@ def test_analyze_with_jd():
         assert report["target_role"] == "Software Engineer"
         assert isinstance(report["section_scores"]["JD Match"], int)
         assert isinstance(report["section_scores"]["Target Role"], int)
+
+def test_analyze_provider_timeout_fallback():
+    mock_db = MagicMock()
+    mock_db.table().select().eq().eq().execute.return_value = MagicMock(
+        data=[{"parsed_structure": {
+            "experience": "Developed software services using Python and FastAPI. Increased throughput by 35%. " * 3,
+            "skills": "Python, SQL, AWS, Docker",
+            "education": "BS in Computer Science",
+            "projects": "Built cloud data pipelines using Python"
+        }}]
+    )
+    mock_db.table().insert().execute.return_value = None
+
+    def mock_get_db():
+        return mock_db
+
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    app.dependency_overrides[get_supabase_client] = mock_get_db
+
+    from app.services.ai_provider import ProviderTimeoutError
+    from app.services.nvidia_provider import NvidiaAIProvider
+
+    with patch.object(NvidiaAIProvider, 'generate', new_callable=AsyncMock) as mock_generate:
+        mock_generate.side_effect = ProviderTimeoutError("The AI response took too long. Please try again.")
+
+        response = client.post("/ats/analyze", json={
+            "document_id": "test_doc_timeout",
+            "target_role": "Backend Engineer",
+            "job_description": "We are seeking a Backend Engineer with Python, SQL, and Kubernetes experience."
+        })
+
+        assert response.status_code == 200
+        report = response.json()
+        assert report["ats_document_id"] == "test_doc_timeout"
+        assert report["target_role"] == "Backend Engineer"
+        assert report["semantic_analysis_available"] is False
+        assert report["analysis_mode"] == "deterministic_fallback"
+        assert "Displaying local deterministic keyword match" in report["semantic_error"]
+        
+        # Verify matched and missing keywords are extracted deterministically
+        matched = report["keyword_analysis"]["matched"]
+        missing = report["keyword_analysis"]["missing"]
+        assert "Python" in matched
+        assert "SQL" in matched
+        assert "Kubernetes" in missing
+        
+        # Verify score is dynamically calculated (not fixed 85 or 90)
+        assert isinstance(report["overall_score"], int)
+        assert 0 < report["overall_score"] < 100
+        assert len(report["recommendations"]) > 0
+        assert len(report["strengths"]) > 0

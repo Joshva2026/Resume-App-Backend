@@ -203,3 +203,65 @@ async def test_nvidia_malformed_missing_content(provider):
         with pytest.raises(MalformedResponseError):
             await provider.generate(req)
 
+@pytest.mark.asyncio
+async def test_effective_timeout_bounds():
+    with patch("app.services.nvidia_provider.settings") as mock_settings:
+        # Default / within bounds
+        mock_settings.AI_CONNECT_TIMEOUT_SECONDS = 10
+        mock_settings.AI_REQUEST_TIMEOUT_SECONDS = 70
+        conn, read = NvidiaAIProvider.get_effective_timeouts()
+        assert conn == 10.0
+        assert read == 70.0
+        
+        # Upper bound enforcement (< 80.0s for Render's 100s deadline)
+        mock_settings.AI_REQUEST_TIMEOUT_SECONDS = 150
+        conn, read = NvidiaAIProvider.get_effective_timeouts()
+        assert read == 80.0
+        
+        # Lower bound enforcement
+        mock_settings.AI_REQUEST_TIMEOUT_SECONDS = 2
+        conn, read = NvidiaAIProvider.get_effective_timeouts()
+        assert read == 5.0
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_success(provider):
+    class MockStreamResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            yield 'data: {"id":"1","choices":[{"delta":{"content":"Hello"}}]}'
+            yield ''
+            yield 'data: {"id":"2","choices":[{"delta":{"content":" World"}}]}'
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockStreamResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Hi")
+        tokens = []
+        async for chunk in provider.generate_stream(req):
+            tokens.append(chunk)
+        assert tokens == ["Hello", " World"]
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_read_timeout(provider):
+    class MockStreamTimeoutResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            raise httpx.ReadTimeout("Streaming read timeout")
+            yield  # make it a generator
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockStreamTimeoutResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Hi")
+        with pytest.raises(ProviderTimeoutError) as exc_info:
+            async for _ in provider.generate_stream(req):
+                pass
+        assert "The AI response took too long" in str(exc_info.value)
+
