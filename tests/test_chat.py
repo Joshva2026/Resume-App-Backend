@@ -122,7 +122,7 @@ def test_chat_provider_timeout_returns_504():
     response = client.post("/ai/chat", json={"message": "Analyze my resume"})
     assert response.status_code == 504
     data = response.json()
-    assert data["detail"] == "AI request timed out"
+    assert data["detail"] == "The AI response took too long. Please try again."
 
 def test_chat_provider_rate_limit_returns_429():
     app.dependency_overrides[get_current_user_id] = mock_get_user

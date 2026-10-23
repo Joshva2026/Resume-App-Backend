@@ -62,16 +62,14 @@ class NvidiaAIProvider(AIProvider):
         }
         
         messages = []
-        
-        final_prompt = request.user_prompt
         if request.system_prompt:
-            final_prompt = f"System Instruction: {request.system_prompt}\n\nUser Input: {request.user_prompt}"
+            messages.append({"role": "system", "content": request.system_prompt})
             
         # Bounded context protection: ensure history isn't excessively large
         for msg in request.history:
             messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
             
-        messages.append({"role": "user", "content": final_prompt})
+        messages.append({"role": "user", "content": request.user_prompt})
         
         # Model selection: configurable via settings / env or request override
         actual_model = (request.model_id or self.model or getattr(settings, "NVIDIA_MODEL", "openai/gpt-oss-20b")).strip()
@@ -80,14 +78,13 @@ class NvidiaAIProvider(AIProvider):
             "model": actual_model,
             "messages": messages,
             "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-            "reasoning_effort": "low"
+            "max_tokens": request.max_tokens
         }
         
         max_retries = 2
         base_delay = 1.0
         connect_timeout = float(getattr(settings, "AI_CONNECT_TIMEOUT_SECONDS", 5.0))
-        read_timeout = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 45.0))
+        read_timeout = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 40.0))
         
         # Payload size diagnostic
         payload_chars = sum(len(m.get("content", "")) for m in messages)
@@ -148,13 +145,30 @@ class NvidiaAIProvider(AIProvider):
                     logger.info(f"status_code={response.status_code}")
                     return self._parse_response(data)
                     
-                except httpx.TimeoutException:
+                except httpx.ReadTimeout as e:
                     duration_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
+                    logger.warning(f"AI Provider read timeout after {duration_ms}ms on {actual_model} (attempt {attempt}). Not retrying to prevent gateway timeout.")
                     logger.info(f"AI_PROVIDER_TIMEOUT duration={duration_ms}ms")
-                    logger.info(f"result=TIMEOUT")
+                    logger.info("result=TIMEOUT")
+                    raise ProviderTimeoutError("The AI response took too long. Please try again.")
+                except httpx.ConnectTimeout as e:
+                    duration_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
+                    logger.warning(f"AI Provider connect timeout after {duration_ms}ms (attempt {attempt}/{max_retries})")
+                    logger.info(f"AI_PROVIDER_CONNECT_TIMEOUT duration={duration_ms}ms")
                     if attempt == max_retries:
-                        logger.error(f"NVIDIA API timeout after {max_retries} attempts")
-                        raise ProviderTimeoutError("AI request timed out")
+                        raise ProviderTimeoutError("Failed to connect to AI provider in time")
+                except httpx.ConnectError as e:
+                    duration_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
+                    logger.warning(f"AI Provider connection error (attempt {attempt}/{max_retries}): {e}")
+                    logger.info("result=CONNECT_ERROR")
+                    if attempt == max_retries:
+                        raise ProviderUnavailableError("Unable to establish connection to AI provider")
+                except httpx.TimeoutException as e:
+                    duration_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
+                    logger.warning(f"AI Provider generic timeout after {duration_ms}ms (attempt {attempt}/{max_retries})")
+                    logger.info("result=TIMEOUT")
+                    if attempt == max_retries:
+                        raise ProviderTimeoutError("The AI response took too long. Please try again.")
                 except (ProviderUnavailableError, RateLimitError) as e:
                     logger.info(f"result=HTTP_ERROR")
                     if attempt == max_retries:

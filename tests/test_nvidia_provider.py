@@ -65,8 +65,18 @@ async def test_nvidia_timeout(provider):
             with pytest.raises(ProviderTimeoutError) as exc_info:
                 await provider.generate(req)
             
-            assert "AI request timed out" in str(exc_info.value)
-            assert mock_post.call_count == 2  # 3 retries
+            assert "The AI response took too long" in str(exc_info.value)
+            assert mock_post.call_count == 2
+
+@pytest.mark.asyncio
+async def test_nvidia_read_timeout_no_retry(provider):
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = httpx.ReadTimeout("Read timed out")
+        req = AIRequest(system_prompt="Test", user_prompt="Test")
+        with pytest.raises(ProviderTimeoutError) as exc_info:
+            await provider.generate(req)
+        assert "The AI response took too long" in str(exc_info.value)
+        assert mock_post.call_count == 1  # Verify no redundant retry on read timeout
 
 @pytest.mark.asyncio
 async def test_nvidia_http_429(provider):
@@ -159,8 +169,8 @@ async def test_nvidia_read_timeout(provider):
             with pytest.raises(ProviderTimeoutError) as exc_info:
                 await provider.generate(req)
                 
-            assert "AI request timed out" in str(exc_info.value)
-            assert mock_post.call_count == 2
+            assert "The AI response took too long" in str(exc_info.value)
+            assert mock_post.call_count == 1  # Verified: do not perform redundant expensive retries on read timeout
 
 @pytest.mark.asyncio
 async def test_nvidia_malformed_empty_choices(provider):

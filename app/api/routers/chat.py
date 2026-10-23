@@ -197,7 +197,7 @@ async def chat(
         user_prompt=chat_req.message,
         history=history_messages,
         temperature=0.7,
-        max_tokens=2048,
+        max_tokens=getattr(settings, "AI_MAX_TOKENS", 1024),
         model_id=model_id
     )
     
@@ -229,7 +229,7 @@ async def chat(
     except ProviderTimeoutError as e:
         _rollback_failed_turn()
         logger.warning(f"AI Provider timeout: {e}")
-        raise HTTPException(status_code=504, detail="AI request timed out")
+        raise HTTPException(status_code=504, detail="The AI response took too long. Please try again.")
     except RateLimitError as e:
         _rollback_failed_turn()
         logger.warning(f"AI Provider rate limit: {e}")
