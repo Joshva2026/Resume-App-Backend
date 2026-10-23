@@ -147,3 +147,49 @@ async def test_invalid_api_key(provider):
             await provider.generate(req)
             
         assert mock_post.call_count == 1  # Should not retry auth errors
+
+@pytest.mark.asyncio
+async def test_nvidia_read_timeout(provider):
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = httpx.ReadTimeout("Read timed out")
+        
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            req = AIRequest(system_prompt="Test", user_prompt="Test")
+            
+            with pytest.raises(ProviderTimeoutError) as exc_info:
+                await provider.generate(req)
+                
+            assert "AI request timed out" in str(exc_info.value)
+            assert mock_post.call_count == 2
+
+@pytest.mark.asyncio
+async def test_nvidia_malformed_empty_choices(provider):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"id": "123", "choices": []}
+    
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+        req = AIRequest(system_prompt="Test", user_prompt="Test")
+        
+        from app.services.ai_provider import MalformedResponseError
+        with pytest.raises(MalformedResponseError):
+            await provider.generate(req)
+
+@pytest.mark.asyncio
+async def test_nvidia_malformed_missing_content(provider):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "id": "123",
+        "choices": [{"message": {"content": ""}, "finish_reason": "stop"}]
+    }
+    
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+        req = AIRequest(system_prompt="Test", user_prompt="Test")
+        
+        from app.services.ai_provider import MalformedResponseError
+        with pytest.raises(MalformedResponseError):
+            await provider.generate(req)
+

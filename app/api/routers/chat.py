@@ -4,7 +4,16 @@ from pydantic import BaseModel
 from supabase import Client
 from app.api.deps import get_current_user_id, get_supabase_client
 from app.api.routers.ai import check_rate_limit, get_ai_provider
-from app.services.ai_provider import AIProvider
+from app.services.ai_provider import (
+    AIProvider,
+    AIException,
+    ProviderAuthenticationError,
+    ProviderUnavailableError,
+    ProviderTimeoutError,
+    InvalidRequestError,
+    RateLimitError,
+    MalformedResponseError,
+)
 from app.schemas.ai import AIRequest
 from app.core.config import settings
 import uuid
@@ -114,15 +123,19 @@ async def chat(
     conversation_id = chat_req.conversation_id
     
     history_messages = []
+    is_new_conversation = False
     
     # 1. Create or verify conversation
     if not conversation_id:
+        is_new_conversation = True
         title = chat_req.message[:40] + "..." if len(chat_req.message) > 40 else chat_req.message
         conv_res = supabase.table("ai_conversations").insert({
             "user_id": user_id,
             "title": title,
             "model_id": model_id
         }).execute()
+        if not conv_res.data:
+            raise HTTPException(status_code=500, detail="Failed to create conversation")
         conversation_id = conv_res.data[0]["id"]
     else:
         conv_check = supabase.table("ai_conversations").select("id").eq("id", conversation_id).eq("user_id", user_id).execute()
@@ -147,13 +160,27 @@ async def chat(
             history_messages.append({"role": m["role"], "content": content})
         
     # 2. Persist User Message
-    supabase.table("ai_messages").insert({
+    user_msg_res = supabase.table("ai_messages").insert({
         "conversation_id": conversation_id,
         "user_id": user_id,
         "role": "user",
         "content": chat_req.message,
         "model_id": model_id
     }).execute()
+    user_msg_id = user_msg_res.data[0]["id"] if (user_msg_res and user_msg_res.data) else None
+
+    # Helper function to rollback DB changes if provider generation fails
+    def _rollback_failed_turn():
+        if user_msg_id:
+            try:
+                supabase.table("ai_messages").delete().eq("id", user_msg_id).execute()
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to cleanup unresponded user message {user_msg_id}: {cleanup_err}")
+        if is_new_conversation and conversation_id:
+            try:
+                supabase.table("ai_conversations").delete().eq("id", conversation_id).execute()
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to cleanup empty conversation {conversation_id}: {cleanup_err}")
     
     # 3. Generate AI Response
     system_prompt = """
@@ -195,20 +222,35 @@ async def chat(
             message=assistant_content,
             model_id=response.model
         )
-    except ProviderAuthenticationError:
+    except ProviderAuthenticationError as e:
+        _rollback_failed_turn()
+        logger.error(f"AI Provider authentication failure: {e}")
         raise HTTPException(status_code=500, detail="AI Provider configuration error")
-    except ProviderUnavailableError:
-        raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
-    except ProviderTimeoutError:
+    except ProviderTimeoutError as e:
+        _rollback_failed_turn()
+        logger.warning(f"AI Provider timeout: {e}")
         raise HTTPException(status_code=504, detail="AI request timed out")
-    except RateLimitError:
+    except RateLimitError as e:
+        _rollback_failed_turn()
+        logger.warning(f"AI Provider rate limit: {e}")
         raise HTTPException(status_code=429, detail="AI provider rate limit exceeded")
-    except InvalidRequestError:
+    except ProviderUnavailableError as e:
+        _rollback_failed_turn()
+        logger.warning(f"AI Provider unavailable: {e}")
+        raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
+    except InvalidRequestError as e:
+        _rollback_failed_turn()
+        logger.error(f"AI Provider invalid request: {e}")
         raise HTTPException(status_code=400, detail="Invalid request to AI service")
-    except MalformedResponseError:
+    except MalformedResponseError as e:
+        _rollback_failed_turn()
+        logger.error(f"AI Provider malformed response: {e}")
         raise HTTPException(status_code=502, detail="Bad response from AI service")
-    except AIException:
+    except AIException as e:
+        _rollback_failed_turn()
+        logger.error(f"AI Provider general exception: {e}")
         raise HTTPException(status_code=500, detail="An error occurred processing the AI request")
     except Exception as e:
-        logger.error(f"AI Assistant Error: {str(e)}")
+        _rollback_failed_turn()
+        logger.error(f"Unexpected AI Assistant Error: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Assistant is temporarily unavailable. Please try again.")

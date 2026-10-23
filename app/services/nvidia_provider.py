@@ -22,10 +22,24 @@ class NvidiaAIProvider(AIProvider):
     @classmethod
     def get_client(cls) -> httpx.AsyncClient:
         if cls._shared_client is None or cls._shared_client.is_closed:
-            timeout_config = httpx.Timeout(120.0, connect=5.0)
+            connect_timeout = float(getattr(settings, "AI_CONNECT_TIMEOUT_SECONDS", 5.0))
+            read_timeout = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 45.0))
+            timeout_config = httpx.Timeout(
+                timeout=read_timeout,
+                connect=connect_timeout,
+                read=read_timeout,
+                write=10.0,
+                pool=5.0
+            )
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0)
             cls._shared_client = httpx.AsyncClient(timeout=timeout_config, limits=limits)
         return cls._shared_client
+
+    @classmethod
+    async def close_client(cls):
+        if cls._shared_client is not None and not cls._shared_client.is_closed:
+            await cls._shared_client.aclose()
+            cls._shared_client = None
 
     def __init__(self):
         self.api_key = settings.NVIDIA_API_KEY
@@ -59,8 +73,8 @@ class NvidiaAIProvider(AIProvider):
             
         messages.append({"role": "user", "content": final_prompt})
         
-        # Hard requirement: must be openai/gpt-oss-20b
-        actual_model = "openai/gpt-oss-20b"
+        # Model selection: configurable via settings / env or request override
+        actual_model = (request.model_id or self.model or getattr(settings, "NVIDIA_MODEL", "openai/gpt-oss-20b")).strip()
         
         payload = {
             "model": actual_model,
@@ -72,6 +86,8 @@ class NvidiaAIProvider(AIProvider):
         
         max_retries = 2
         base_delay = 1.0
+        connect_timeout = float(getattr(settings, "AI_CONNECT_TIMEOUT_SECONDS", 5.0))
+        read_timeout = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 45.0))
         
         # Payload size diagnostic
         payload_chars = sum(len(m.get("content", "")) for m in messages)
@@ -86,8 +102,8 @@ class NvidiaAIProvider(AIProvider):
                     logger.info(f"model={actual_model}")
                     logger.info(f"api_key_configured={bool(api_key)}")
                     logger.info(f"api_key_length={len(api_key) if api_key else 0}")
-                    logger.info(f"connect_timeout=5.0")
-                    logger.info(f"read_timeout=120.0")
+                    logger.info(f"connect_timeout={connect_timeout}")
+                    logger.info(f"read_timeout={read_timeout}")
                     logger.info(f"max_tokens={request.max_tokens}")
                     logger.info(f"payload_chars={payload_chars}")
                     logger.info(f"attempt={attempt}")
@@ -151,8 +167,10 @@ class NvidiaAIProvider(AIProvider):
                     if attempt == max_retries:
                         raise ProviderUnavailableError("Unexpected error communicating with AI provider")
                         
-                # Bounded exponential backoff before retry
-                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+                # Bounded exponential backoff with jitter before retry
+                import random
+                jitter = random.uniform(0.1, 0.4)
+                await asyncio.sleep((base_delay * (2 ** (attempt - 1))) + jitter)
 
         raise ProviderUnavailableError("Failed to communicate with AI provider")
 
@@ -174,6 +192,8 @@ class NvidiaAIProvider(AIProvider):
             logger.error("NVIDIA API endpoint or model not found (404)")
             raise InvalidRequestError("AI provider endpoint or model not found")
         elif status == 429:
+            retry_after = response.headers.get("Retry-After")
+            logger.warning(f"NVIDIA API rate limit (429), Retry-After: {retry_after}")
             raise RateLimitError("AI provider rate limit exceeded")
         elif status == 400 or status == 422:
             logger.error(f"NVIDIA API invalid request: {sanitized_text}")
