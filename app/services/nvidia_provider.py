@@ -17,6 +17,16 @@ from app.services.ai_provider import (
 logger = logging.getLogger(__name__)
 
 class NvidiaAIProvider(AIProvider):
+    _shared_client = None
+
+    @classmethod
+    def get_client(cls) -> httpx.AsyncClient:
+        if cls._shared_client is None or cls._shared_client.is_closed:
+            timeout_config = httpx.Timeout(120.0, connect=5.0)
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0)
+            cls._shared_client = httpx.AsyncClient(timeout=timeout_config, limits=limits)
+        return cls._shared_client
+
     def __init__(self):
         self.api_key = settings.NVIDIA_API_KEY
         self.base_url = settings.NVIDIA_BASE_URL
@@ -63,15 +73,11 @@ class NvidiaAIProvider(AIProvider):
         max_retries = 2
         base_delay = 1.0
         
-        # Explicit connection vs read timeouts
-        # Connect timeout: 5 seconds. Read timeout (generation): 120 seconds.
-        timeout_config = httpx.Timeout(120.0, connect=5.0)
-        
         # Payload size diagnostic
         payload_chars = sum(len(m.get("content", "")) for m in messages)
         
-        async with httpx.AsyncClient(timeout=timeout_config) as client:
-            for attempt in range(1, max_retries + 1):
+        client = self.get_client()
+        for attempt in range(1, max_retries + 1):
                 try:
                     logger.info("=== NVIDIA DIAGNOSTIC ===")
                     logger.info("provider=nvidia")
