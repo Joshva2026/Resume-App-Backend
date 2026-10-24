@@ -8,6 +8,7 @@ class AIRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, ge=1, le=4096)
     model_id: Optional[str] = None
+    timeout: Optional[float] = None
     
     model_config = {"protected_namespaces": ()}
 

@@ -10,6 +10,7 @@ class AtsAnalyzeRequest(BaseModel):
     document_id: str
     target_role: Optional[str] = None
     job_description: Optional[str] = None
+    bypass_cache: Optional[bool] = False
 
 class AtsReport(BaseModel):
     ats_document_id: str

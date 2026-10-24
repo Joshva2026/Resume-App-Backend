@@ -2,6 +2,7 @@ import httpx
 import logging
 import asyncio
 import json
+from typing import Optional
 from app.core.config import settings
 from app.schemas.ai import AIRequest, AIResponse, AIResponseUsage
 from app.services.ai_provider import (
@@ -21,29 +22,34 @@ class NvidiaAIProvider(AIProvider):
     _shared_client = None
 
     @classmethod
-    def get_effective_timeouts(cls) -> tuple[float, float, float, float]:
+    def get_effective_timeouts(cls) -> tuple[float, float, Optional[float], Optional[float]]:
         connect_timeout = float(getattr(settings, "AI_CONNECT_TIMEOUT_SECONDS", 10.0))
         configured_read = float(getattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 70.0))
-        configured_stream_read = float(getattr(settings, "AI_STREAM_READ_TIMEOUT_SECONDS", 85.0))
-        configured_inter_chunk = float(getattr(settings, "AI_INTER_CHUNK_TIMEOUT_SECONDS", 25.0))
+        configured_stream_read = getattr(settings, "AI_STREAM_READ_TIMEOUT_SECONDS", None)
+        configured_inter_chunk = getattr(settings, "AI_INTER_CHUNK_TIMEOUT_SECONDS", None)
         
         # Keep read timeout bounded for non-streaming
         read_timeout = max(5.0, min(configured_read, 80.0))
-        # Keep stream read timeout bounded between 10.0s and 90.0s (strictly below Render's 100s deadline)
-        stream_read_timeout = max(10.0, min(configured_stream_read, 90.0))
-        # Inter-chunk timeout bounded between 5.0s and 45.0s
-        inter_chunk_timeout = max(5.0, min(configured_inter_chunk, 45.0))
         
+        # Stream read timeout is None by default (disabled) to allow long generations to finish
+        stream_read_timeout = None
+        if configured_stream_read is not None:
+            stream_read_timeout = max(10.0, min(float(configured_stream_read), 90.0))
+            
+        inter_chunk_timeout = None
+        if configured_inter_chunk is not None:
+            inter_chunk_timeout = max(5.0, min(float(configured_inter_chunk), 45.0))
+            
         return connect_timeout, read_timeout, stream_read_timeout, inter_chunk_timeout
 
     @classmethod
     def get_client(cls) -> httpx.AsyncClient:
-        connect_timeout, _, stream_read_timeout, _ = cls.get_effective_timeouts()
+        connect_timeout, read_timeout, _, _ = cls.get_effective_timeouts()
         if cls._shared_client is None or cls._shared_client.is_closed:
             timeout_config = httpx.Timeout(
-                timeout=stream_read_timeout,
+                timeout=read_timeout,
                 connect=connect_timeout,
-                read=stream_read_timeout,
+                read=read_timeout,
                 write=10.0,
                 pool=5.0
             )
@@ -99,7 +105,9 @@ class NvidiaAIProvider(AIProvider):
         
         max_retries = 2
         base_delay = 1.0
-        connect_timeout, read_timeout, _, _ = self.get_effective_timeouts()
+        connect_timeout, default_read_timeout, _, _ = self.get_effective_timeouts()
+        read_timeout = float(request.timeout) if request.timeout is not None else default_read_timeout
+        read_timeout = max(5.0, min(read_timeout, 80.0))
         timeout_config = httpx.Timeout(
             timeout=read_timeout,
             connect=connect_timeout,
@@ -240,7 +248,12 @@ class NvidiaAIProvider(AIProvider):
             "stream": True
         }
         
-        connect_timeout, read_timeout, stream_read_timeout, inter_chunk_timeout = self.get_effective_timeouts()
+        connect_timeout, default_read_timeout, configured_stream_read, configured_inter_chunk = self.get_effective_timeouts()
+        
+        # Read timeout is disabled (None) for streaming by default so valid long generations are not terminated.
+        # Can still be overridden by request.timeout if explicitly specified by caller.
+        stream_read_timeout = float(request.timeout) if request.timeout is not None else configured_stream_read
+        
         timeout_config = httpx.Timeout(
             timeout=stream_read_timeout,
             connect=connect_timeout,
@@ -253,8 +266,7 @@ class NvidiaAIProvider(AIProvider):
         host = self.base_url.split("://")[-1].split("/")[0] if "://" in self.base_url else self.base_url
         logger.info(
             f"AI_STREAM_START model={actual_model} host={host} connect_to={connect_timeout}s "
-            f"stream_read_to={stream_read_timeout}s inter_chunk_to={inter_chunk_timeout}s "
-            f"max_tokens={request.max_tokens} payload_chars={payload_chars}"
+            f"stream_read_to={stream_read_timeout} max_tokens={request.max_tokens} payload_chars={payload_chars}"
         )
         
         client = self.get_client()
@@ -269,6 +281,7 @@ class NvidiaAIProvider(AIProvider):
         content_chars_count = 0
         reasoning_chunks_count = 0
         accumulated_reasoning = []
+        finish_reason = None
         
         try:
             async with client.stream(
@@ -284,35 +297,7 @@ class NvidiaAIProvider(AIProvider):
                     await response.aread()
                     self._handle_http_errors(response, actual_model, self.base_url)
                 
-                line_iterator = response.aiter_lines().__aiter__()
-                while True:
-                    # Timeouts: TTFT before first content token, then inter-chunk idle timeout
-                    if content_chunks_count == 0:
-                        elapsed = time.time() - t_start
-                        current_timeout = max(1.0, stream_read_timeout - elapsed)
-                    else:
-                        current_timeout = inter_chunk_timeout
-                    
-                    try:
-                        line = await asyncio.wait_for(line_iterator.__anext__(), timeout=current_timeout)
-                    except StopAsyncIteration:
-                        break
-                    except (asyncio.TimeoutError, TimeoutError):
-                        duration_ms = int((time.time() - t_start) * 1000)
-                        if content_chunks_count == 0:
-                            logger.warning(
-                                f"AI Provider streaming TTFT timeout after {duration_ms}ms on {actual_model} "
-                                f"(timeout={stream_read_timeout}s, reasoning_chunks={reasoning_chunks_count})"
-                            )
-                            raise ProviderTimeoutError("The AI response took too long. Please try again.")
-                        else:
-                            logger.warning(
-                                f"AI Provider streaming inter-chunk stall: no chunk received for {inter_chunk_timeout}s "
-                                f"after {content_chunks_count} chunks / {content_chars_count} chars on {actual_model} "
-                                f"(total_duration={duration_ms}ms)"
-                            )
-                            raise ProviderTimeoutError("The AI stream stalled after partial generation. Please try again.")
-
+                async for line in response.aiter_lines():
                     if not line:
                         continue
                     if line.startswith(":"):
@@ -329,7 +314,10 @@ class NvidiaAIProvider(AIProvider):
                                 
                             choices = chunk.get("choices", [])
                             if choices:
-                                delta = choices[0].get("delta", {})
+                                choice = choices[0]
+                                if choice.get("finish_reason"):
+                                    finish_reason = choice.get("finish_reason")
+                                delta = choice.get("delta", {})
                                 content = delta.get("content") or ""
                                 reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
                                 
@@ -369,9 +357,10 @@ class NvidiaAIProvider(AIProvider):
                 total_duration_ms = int((time.time() - t_start) * 1000)
                 ttft_ms = int(first_token_time * 1000) if first_token_time else None
                 logger.info(
-                    f"AI_STREAM_SUCCESS model={actual_model} duration={total_duration_ms}ms "
-                    f"ttft={ttft_ms}ms chunks={content_chunks_count} chars={content_chars_count} "
-                    f"reasoning_chunks={reasoning_chunks_count} max_gap={int(max_inter_chunk_gap*1000)}ms"
+                    f"AI_STREAM_METRICS model={actual_model} duration_ms={total_duration_ms} "
+                    f"ttfb_ms={int(ttfb*1000)} ttft_ms={ttft_ms} chunks={content_chunks_count} "
+                    f"chars={content_chars_count} reasoning_chunks={reasoning_chunks_count} "
+                    f"max_inter_chunk_ms={int(max_inter_chunk_gap*1000)} finish_reason={finish_reason}"
                 )
 
         except httpx.ReadTimeout:
@@ -389,6 +378,10 @@ class NvidiaAIProvider(AIProvider):
             duration_ms = int((time.time() - t_start) * 1000)
             logger.warning(f"AI Provider streaming connection error after {duration_ms}ms: {e} (category=connect_error)")
             raise ProviderUnavailableError("Unable to establish connection to AI provider")
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            duration_ms = int((time.time() - t_start) * 1000)
+            logger.warning(f"AI Provider streaming transport disconnect after {duration_ms}ms: {e} (category=disconnect)")
+            raise ProviderUnavailableError("AI provider connection was interrupted")
         except httpx.TimeoutException:
             duration_ms = int((time.time() - t_start) * 1000)
             logger.warning(f"AI Provider streaming generic timeout after {duration_ms}ms (category=generic_timeout)")

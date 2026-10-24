@@ -6,10 +6,11 @@ import uuid
 from app.schemas.ats import AtsParseResponse, AtsAnalyzeRequest, AtsReport
 from app.services.ats_parser import AtsParser
 from app.services.ats_scorer import AtsScorer
-from app.services.ats_semantic_analyzer import AtsSemanticAnalyzer
+from app.services.ats_semantic_analyzer import AtsSemanticAnalyzer, get_default_ats_provider
 from app.services.ats_cache import AtsAnalysisCache
 from app.services.ats_privacy import ResumePrivacyRedactor
-from app.services.nvidia_provider import NvidiaAIProvider
+from app.services.grok_provider import XAIGrokAIProvider, GrokAIProvider
+from app.services.groq_provider import GroqAIProvider
 from app.api.routers.ai import check_rate_limit
 from app.api.deps import get_current_user_id, get_supabase_client
 from supabase import Client
@@ -226,7 +227,7 @@ async def analyze_resume(
     if len(sanitized_text) < 50:
         raise HTTPException(status_code=422, detail="Document contains insufficient content for analysis")
 
-    # 2. Cache Lookup
+    # 2. Cache Lookup (unless caller explicitly requested bypass_cache e.g. on manual retry)
     # Isolated by user_id, sanitized resume text fingerprint, job description, target role, and scoring version
     cache_key = AtsAnalysisCache.make_key(
         user_id=user_id,
@@ -235,10 +236,11 @@ async def analyze_resume(
         target_role=analyze_req.target_role,
         scoring_version=scorer.SCORING_VERSION
     )
-    cached_report = AtsAnalysisCache.get(cache_key)
-    if cached_report:
-        logger.info(f"ATS cache hit for user={user_id} doc={analyze_req.document_id}")
-        return cached_report
+    if not analyze_req.bypass_cache:
+        cached_report = AtsAnalysisCache.get(cache_key)
+        if cached_report:
+            logger.info(f"ATS cache hit for user={user_id} doc={analyze_req.document_id}")
+            return cached_report
         
     # 3. Dynamic Deterministic Scoring
     score_result = scorer.calculate_score(
@@ -249,7 +251,7 @@ async def analyze_resume(
     )
     
     # 4. AI Semantic Analysis (with deterministic fallback)
-    provider = NvidiaAIProvider()
+    provider = get_default_ats_provider()
     analyzer = AtsSemanticAnalyzer(provider)
     semantic_result = await analyzer.analyze(
         sanitized_text, 

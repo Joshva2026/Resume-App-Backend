@@ -69,9 +69,30 @@ class ResumePrivacyRedactor:
         re.IGNORECASE
     )
 
-    # Token and secret patterns (prevent leakage of internal credentials)
+    # Government identification patterns (SSN, Aadhaar, Passport, National ID, PAN, DL)
+    SSN_REGEX = re.compile(
+        r'\b(?:\d{3}-\d{2}-\d{4}|(?:ssn|social\s+security(?:\s+number)?)\s*[:#-]?\s*\d{3}-?\d{2}-?\d{4})\b',
+        re.IGNORECASE
+    )
+
+    AADHAAR_REGEX = re.compile(
+        r'\b(?:(?:aadhaar|aadhar|uidai)\s*[:#-]?\s*)?\d{4}[\s-]\d{4}[\s-]\d{4}\b',
+        re.IGNORECASE
+    )
+
+    PASSPORT_REGEX = re.compile(
+        r'\b(?:passport(?:\s+no|\s+number)?)\s*[:#-]?\s*[A-PR-WYa-pr-wy][1-9]\d\s?\d{4}[1-9]\b',
+        re.IGNORECASE
+    )
+
+    GOV_ID_REGEX = re.compile(
+        r'\b(?:national\s+id|driver(?:[\'’]s)?\s+license|dl\s+no|pan\s+card|pan\s+no|tax\s+id)\s*[:#-]?\s*[A-Za-z0-9-]{6,16}\b',
+        re.IGNORECASE
+    )
+
+    # Token and secret patterns (prevent leakage of internal credentials or provider API keys)
     TOKEN_REGEX = re.compile(
-        r'\b(?:sbp_[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|Bearer\s+[A-Za-z0-9_.-]+)\b',
+        r'\b(?:xai-[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9_-]{20,}|nvapi-[A-Za-z0-9_-]{20,}|sbp_[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|Bearer\s+[A-Za-z0-9_.-]+)\b',
         re.IGNORECASE
     )
 
@@ -132,11 +153,17 @@ class ResumePrivacyRedactor:
         # 6. Redact date of birth / age
         redacted = self.DOB_REGEX.sub("[DOB REDACTED]", redacted)
 
-        # 7. Redact street addresses
+        # 7. Redact government identification numbers (SSN, Aadhaar, Passport, etc.)
+        redacted = self.SSN_REGEX.sub("[GOV_ID REDACTED]", redacted)
+        redacted = self.AADHAAR_REGEX.sub("[GOV_ID REDACTED]", redacted)
+        redacted = self.PASSPORT_REGEX.sub("[GOV_ID REDACTED]", redacted)
+        redacted = self.GOV_ID_REGEX.sub("[GOV_ID REDACTED]", redacted)
+
+        # 8. Redact street addresses and postal codes
         redacted = self.STREET_ADDRESS_REGEX.sub("[ADDRESS REDACTED]", redacted)
         redacted = self.POSTAL_CODE_REGEX.sub("[POSTAL REDACTED]", redacted)
 
-        # 8. Redact candidate name if provided or detectable
+        # 9. Redact candidate name if provided or detectable
         if candidate_names:
             for name in candidate_names:
                 if not name or len(name.strip()) < 3:
@@ -148,17 +175,18 @@ class ResumePrivacyRedactor:
                 pattern = re.compile(r'\b' + re.escape(name_clean) + r'\b', re.IGNORECASE)
                 redacted = pattern.sub("[CANDIDATE NAME]", redacted)
 
-        # 9. Contextual Name Headers e.g. "Name: Jane Doe", "Candidate Name: Alex Smith"
+        # 10. Contextual Name Headers e.g. "Name: Jane Doe", "Candidate Name: Alex Smith"
         name_header_pattern = re.compile(
             r'\b(?:candidate(?:\s+name)?|name|full\s+name)\s*[:#-]\s*[A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){1,3}\b',
             re.IGNORECASE
         )
         redacted = name_header_pattern.sub("Candidate: [CANDIDATE NAME]", redacted)
 
-        # 10. Clean up any redundant redaction markers
+        # 11. Clean up any redundant redaction markers
         redacted = re.sub(r'(\[PHONE REDACTED\][\s,;]*)+', '[PHONE REDACTED] ', redacted)
         redacted = re.sub(r'(\[EMAIL REDACTED\][\s,;]*)+', '[EMAIL REDACTED] ', redacted)
         redacted = re.sub(r'(\[CANDIDATE NAME\][\s,;]*)+', '[CANDIDATE NAME] ', redacted)
+        redacted = re.sub(r'(\[GOV_ID REDACTED\][\s,;]*)+', '[GOV_ID REDACTED] ', redacted)
 
         return redacted
 
@@ -239,17 +267,24 @@ class ResumePrivacyRedactor:
     def verify_request_safety(self, prompt: str) -> Tuple[bool, str]:
         """
         Final safety gate at the provider-request boundary.
-        Guarantees that no raw emails, phone numbers, or tokens are sent to NVIDIA NIM.
+        Guarantees that no raw emails, phone numbers, government IDs, profile URLs,
+        or secrets/tokens are sent to the external AI provider (Groq).
         Returns (is_safe, sanitized_prompt).
         """
-        # If any raw email is still found, redact it immediately
+        # Redact any remaining high-risk identifiers immediately
         clean_prompt = self.EMAIL_REGEX.sub("[EMAIL REDACTED]", prompt)
         clean_prompt = self.TOKEN_REGEX.sub("[TOKEN REDACTED]", clean_prompt)
         clean_prompt = self.LINKEDIN_URL_REGEX.sub("[LINKEDIN REDACTED]", clean_prompt)
+        clean_prompt = self.SOCIAL_URL_REGEX.sub("[SOCIAL REDACTED]", clean_prompt)
         clean_prompt = self.LABELED_PHONE_REGEX.sub("[PHONE REDACTED]", clean_prompt)
+        clean_prompt = self.SSN_REGEX.sub("[GOV_ID REDACTED]", clean_prompt)
+        clean_prompt = self.AADHAAR_REGEX.sub("[GOV_ID REDACTED]", clean_prompt)
+        clean_prompt = self.PASSPORT_REGEX.sub("[GOV_ID REDACTED]", clean_prompt)
+        clean_prompt = self.GOV_ID_REGEX.sub("[GOV_ID REDACTED]", clean_prompt)
 
         has_unredacted_email = bool(self.EMAIL_REGEX.search(clean_prompt))
         has_token = bool(self.TOKEN_REGEX.search(clean_prompt))
+        has_unredacted_gov_id = bool(self.SSN_REGEX.search(clean_prompt)) or bool(self.AADHAAR_REGEX.search(clean_prompt))
 
-        is_safe = not (has_unredacted_email or has_token)
+        is_safe = not (has_unredacted_email or has_token or has_unredacted_gov_id)
         return is_safe, clean_prompt

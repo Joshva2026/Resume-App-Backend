@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 from app.main import app
+from app.core.config import settings
 from app.api.deps import get_current_user_id, get_supabase_client
 from app.api.routers.ai import get_ai_provider, _rate_limits
 from app.schemas.ai import AIResponse, AIResponseUsage
@@ -423,5 +424,39 @@ def test_chat_existing_conversation_not_deleted_on_failure():
     mock_sb.table("ai_messages").delete.assert_called()
     # But ai_conversations MUST NOT be deleted because it is an existing conversation
     mock_sb.table("ai_conversations").delete.assert_not_called()
+
+def test_chat_stream_heartbeats_without_visible_text_contamination():
+    import asyncio
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-heartbeat", msg_id="msg-heartbeat")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_with_delay(req):
+        # Delay before first token to allow keepalive to fire
+        await asyncio.sleep(0.08)
+        yield "Final answer chunk."
+    mock_provider.generate_stream = mock_stream_with_delay
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    with patch.object(settings, "AI_STREAM_KEEPALIVE_INTERVAL_SECONDS", 0.03):
+        response = client.post("/ai/chat/stream", json={"message": "Test heartbeats"})
+        assert response.status_code == 200
+        raw_text = response.text
+        
+        # Verify keepalive comment was emitted
+        assert ": keepalive" in raw_text
+        
+        # Verify text chunks only contain the actual content and NO keepalive text
+        lines = [line for line in raw_text.split("\n") if line.startswith("data: ")]
+        import json
+        chunk_data = [json.loads(line[6:]) for line in lines]
+        
+        # First data item is chunk, second is done
+        content_tokens = [d["content"] for d in chunk_data if d["type"] == "chunk"]
+        assert content_tokens == ["Final answer chunk."]
+        # Ensure no ": keepalive" or comments leaked into content
+        assert all(": keepalive" not in t for t in content_tokens)
+
 
 

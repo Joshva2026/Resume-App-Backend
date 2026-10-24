@@ -321,4 +321,126 @@ async def test_nvidia_generate_stream_error_chunk_raises_exception(provider):
             async for _ in provider.generate_stream(req):
                 pass
 
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_delayed_first_token(provider):
+    class MockDelayedStreamResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            # Simulate initial upstream reasoning/thinking delay
+            await asyncio.sleep(0.05)
+            yield 'data: {"choices":[{"delta":{"content":"First token arrived after delay"}}]}'
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockDelayedStreamResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Explain coroutines")
+        tokens = []
+        async for chunk in provider.generate_stream(req):
+            tokens.append(chunk)
+        assert tokens == ["First token arrived after delay"]
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_inter_chunk_delays(provider):
+    class MockInterChunkDelayedResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"Chunk 1"}}]}'
+            await asyncio.sleep(0.04)
+            yield 'data: {"choices":[{"delta":{"content":" Chunk 2"}}]}'
+            await asyncio.sleep(0.04)
+            yield 'data: {"choices":[{"delta":{"content":" Chunk 3"}}]}'
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockInterChunkDelayedResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Count to 3")
+        tokens = []
+        async for chunk in provider.generate_stream(req):
+            tokens.append(chunk)
+        assert tokens == ["Chunk 1", " Chunk 2", " Chunk 3"]
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_genuine_disconnect_raises_unavailable(provider):
+    class MockDisconnectResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"Partial output"}}]}'
+            raise httpx.RemoteProtocolError("Server closed TCP connection abruptly")
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockDisconnectResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Test disconnect")
+        with pytest.raises(ProviderUnavailableError) as exc_info:
+            async for _ in provider.generate_stream(req):
+                pass
+        assert "interrupted" in str(exc_info.value).lower()
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_cancellation_releases_resources(provider):
+    stream_closed = False
+
+    class MockCancellableResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            nonlocal stream_closed
+            stream_closed = True
+        async def aiter_lines(self):
+            for i in range(100):
+                yield f'data: {{"choices":[{{"delta":{{"content":"token_{i} "}}}}]}}'
+                await asyncio.sleep(0.01)
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockCancellableResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Long stream")
+        
+        received = []
+        gen = provider.generate_stream(req)
+        async for chunk in gen:
+            received.append(chunk)
+            if len(received) >= 2:
+                # Consumer cancels early
+                await gen.aclose()
+                break
+
+        assert len(received) == 2
+        assert stream_closed is True
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_long_complete_response(provider):
+    class MockLongResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            for i in range(30):
+                yield f'data: {{"choices":[{{"delta":{{"content":"word{i} "}}}}]}}'
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockLongResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Write an essay")
+        tokens = []
+        async for chunk in provider.generate_stream(req):
+            tokens.append(chunk)
+        assert len(tokens) == 30
+        assert tokens[0] == "word0 "
+        assert tokens[29] == "word29 "
+
+
 

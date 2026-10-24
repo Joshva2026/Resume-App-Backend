@@ -37,10 +37,14 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Graceful shutdown of persistent HTTP client
+    # Graceful shutdown of persistent HTTP clients
     try:
         from app.services.nvidia_provider import NvidiaAIProvider
+        from app.services.groq_provider import GroqAIProvider
+        from app.services.grok_provider import XAIGrokAIProvider
         await NvidiaAIProvider.close_client()
+        await GroqAIProvider.close_client()
+        await XAIGrokAIProvider.close_client()
     except Exception as e:
         print(f"Error during shutdown: {e}", flush=True)
 

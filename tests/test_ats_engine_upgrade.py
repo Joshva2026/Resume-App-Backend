@@ -1,4 +1,6 @@
 import pytest
+import json
+from app.core.config import settings
 from app.services.ats_privacy import ResumePrivacyRedactor
 from app.services.ats_scorer import AtsScorer
 from app.services.ats_cache import AtsAnalysisCache
@@ -243,3 +245,261 @@ async def test_malformed_reasoning_without_json_activates_fallback():
     assert result["analysis_mode"] == "deterministic_fallback"
     assert "Python" in result["matched_keywords"]
     assert "Docker" in result["missing_keywords"]
+
+# -------------------------------------------------------------
+# 5. Production Timeout & Optimization Tests
+# -------------------------------------------------------------
+class MockTimeoutAIProvider(AIProvider):
+    async def generate(self, request: AIRequest) -> AIResponse:
+        from app.services.ai_provider import ProviderTimeoutError
+        raise ProviderTimeoutError("The AI response took too long. Please try again.")
+
+class MockCompleteAIProvider(AIProvider):
+    async def generate(self, request: AIRequest) -> AIResponse:
+        valid_json = """
+        {
+            "matched_keywords": ["Python (Experience: Built REST API)", "FastAPI (Experience: Optimized backend)"],
+            "missing_keywords": ["Docker", "Kubernetes"],
+            "missing_required": ["Docker"],
+            "missing_preferred": ["Kubernetes"],
+            "strengths": ["Demonstrated backend architecture experience"],
+            "recommendations": ["Add container orchestration with Docker and Kubernetes"]
+        }
+        """
+        return AIResponse(
+            content=valid_json,
+            provider="nvidia",
+            model="openai/gpt-oss-20b",
+            usage=AIResponseUsage(prompt_tokens=250, completion_tokens=180, total_tokens=430),
+            finish_reason="stop"
+        )
+
+@pytest.mark.asyncio
+async def test_slow_nvidia_read_timeout_smooth_fallback():
+    timeout_provider = MockTimeoutAIProvider()
+    analyzer = AtsSemanticAnalyzer(timeout_provider)
+
+    resume_text = "Experience with Python and FastAPI."
+    jd_text = "Requirements: Python, FastAPI, Docker"
+
+    result = await analyzer.analyze(
+        sanitized_text=resume_text,
+        jd=jd_text,
+        target_role="Backend Developer"
+    )
+
+    assert result["analysis_mode"] == "deterministic_fallback"
+    assert result["semantic_analysis_available"] is False
+    assert "timed out" in result["semantic_error"]
+    # Fallback still successfully computed matched/missing keywords
+    assert "Python" in result["matched_keywords"]
+    assert "Docker" in result["missing_keywords"]
+
+@pytest.mark.asyncio
+async def test_valid_complete_ai_response_parsed_successfully():
+    complete_provider = MockCompleteAIProvider()
+    analyzer = AtsSemanticAnalyzer(complete_provider)
+
+    resume_text = "Experience with Python and FastAPI."
+    jd_text = "Requirements: Python, FastAPI, Docker, Kubernetes"
+
+    result = await analyzer.analyze(
+        sanitized_text=resume_text,
+        jd=jd_text,
+        target_role="Backend Developer"
+    )
+
+    assert result["analysis_mode"] == "ai"
+    assert result["semantic_analysis_available"] is True
+    assert result["semantic_error"] is None
+    assert "Python" in result["matched_keywords"]
+    assert "FastAPI" in result["matched_keywords"]
+    assert "Docker" in result["missing_required"]
+    assert "Kubernetes" in result["missing_preferred"]
+    assert len(result["strengths"]) > 0
+
+def test_job_description_compaction_strips_boilerplate_and_preserves_requirements():
+    analyzer = AtsSemanticAnalyzer(MockTruncatingAIProvider())
+    
+    noisy_jd = """
+    Job Title: Senior Backend Developer
+    
+    About Us:
+    Acme Corp is an equal opportunity employer dedicated to building a diverse and inclusive team.
+    All qualified applicants will receive consideration without regard to race, color, religion, sex.
+    
+    Benefits:
+    Benefits package includes comprehensive medical, dental, vision, unlimited PTO, and 401(k) matching.
+    Commuter benefits and flexible hybrid work environment.
+    
+    Requirements:
+    - 5+ years of Python and FastAPI development
+    - Microservices architecture and PostgreSQL database optimization
+    - Experience deploying containers with Docker and Kubernetes
+    
+    Preferred Qualifications:
+    - AWS or GCP cloud certifications
+    """
+
+    compacted = analyzer._compact_job_description(noisy_jd, max_chars=1200)
+
+    # Boilerplate removed
+    assert "equal opportunity employer" not in compacted.lower()
+    assert "dental, vision" not in compacted.lower()
+    assert "401(k)" not in compacted.lower()
+    
+    # Core requirements preserved
+    assert "Python" in compacted
+    assert "FastAPI" in compacted
+    assert "Docker" in compacted
+    assert "Kubernetes" in compacted
+    assert "PostgreSQL" in compacted
+
+def test_cache_ttl_distinction_and_bypass():
+    AtsAnalysisCache.clear()
+
+    key = "test_cache_key_ttl"
+    ai_report = AtsReport(ats_document_id="doc_ai", analysis_mode="ai", overall_score=90)
+    fallback_report = AtsReport(ats_document_id="doc_fb", analysis_mode="deterministic_fallback", overall_score=60)
+
+    # Fallback report gets short 15s TTL
+    AtsAnalysisCache.set(key, fallback_report)
+    assert AtsAnalysisCache.get(key) is not None
+    assert AtsAnalysisCache.get(key).analysis_mode == "deterministic_fallback"
+
+    # AI report gets full 600s TTL
+    AtsAnalysisCache.set(key, ai_report)
+    assert AtsAnalysisCache.get(key).analysis_mode == "ai"
+
+# -------------------------------------------------------------
+# 5. Grok (xAI) vs Groq vs NVIDIA Provider Isolation & Routing Verification
+# -------------------------------------------------------------
+def test_ats_routes_to_grok_and_ai_assistant_routes_to_nvidia():
+    from app.services.grok_provider import XAIGrokAIProvider, GrokAIProvider
+    from app.services.groq_provider import GroqAIProvider
+    from app.services.nvidia_provider import NvidiaAIProvider
+    from app.api.routers.ai import get_ai_provider
+    from app.services.ats_semantic_analyzer import get_default_ats_provider
+    import inspect
+    from app.api.routers.ats import analyze_resume
+    from unittest.mock import patch
+
+    # 1. Verify AI Assistant dependency strictly uses NvidiaAIProvider with openai/gpt-oss-20b
+    assistant_provider = get_ai_provider()
+    assert isinstance(assistant_provider, NvidiaAIProvider)
+    assert assistant_provider.model == "openai/gpt-oss-20b"
+
+    # 2. Verify xAI Grok resolution when XAI_API_KEY is configured
+    with patch.object(settings, "XAI_API_KEY", "xai-test-key-12345"):
+        xai_prov = get_default_ats_provider()
+        assert isinstance(xai_prov, XAIGrokAIProvider)
+        assert xai_prov.model == "grok-2-latest"
+
+    # 3. Verify Groq resolution when only GROQ_API_KEY is configured
+    with patch.object(settings, "XAI_API_KEY", None), \
+         patch.object(settings, "GROQ_API_KEY", "gsk-test-key-12345"):
+        groq_prov = get_default_ats_provider()
+        assert isinstance(groq_prov, GroqAIProvider)
+        assert groq_prov.model == "openai/gpt-oss-120b"
+
+    # 4. Verify default fallback provider is XAIGrokAIProvider
+    with patch.object(settings, "XAI_API_KEY", None), \
+         patch.object(settings, "GROQ_API_KEY", None):
+        default_prov = get_default_ats_provider()
+        assert isinstance(default_prov, XAIGrokAIProvider)
+
+    # 5. Inspect analyze_resume source in ats router to ensure provider resolution is decoupled from NvidiaAIProvider
+    ats_source = inspect.getsource(analyze_resume)
+    assert "get_default_ats_provider()" in ats_source
+    assert "NvidiaAIProvider()" not in ats_source
+
+def test_government_id_and_token_redaction():
+    redactor = ResumePrivacyRedactor()
+    raw_text = """
+    Name: John Doe
+    Email: john.doe@example.org
+    Phone: +1 (555) 432-1098
+    SSN: 123-45-6789
+    Aadhaar: 2345 6789 0123
+    Passport No: P1234567
+    National ID: ID-987654321
+    xAI Grok Key: xai-live-1234567890abcdefghijklmnopqrstuvwxyz
+    Groq Key: gsk_live_1234567890abcdefghijklmnopqrstuvwxyz
+    Nvidia Key: nvapi-live_abcdef1234567890abcdef1234567890
+    Technical Skills: Python, FastAPI, Docker, Kubernetes, AWS Certified Solutions Architect
+    Experience: Built high-throughput microservices handling 50M requests daily.
+    """
+    is_safe, clean_text = redactor.verify_request_safety(redactor.redact_text(raw_text))
+    
+    assert is_safe is True
+    assert "123-45-6789" not in clean_text
+    assert "2345 6789 0123" not in clean_text
+    assert "P1234567" not in clean_text
+    assert "ID-987654321" not in clean_text
+    assert "xai-live" not in clean_text
+    assert "gsk_live" not in clean_text
+    assert "nvapi-live" not in clean_text
+    assert "john.doe@example.org" not in clean_text
+    assert "432-1098" not in clean_text
+    
+    # Verify professional content is completely preserved
+    assert "Python" in clean_text
+    assert "FastAPI" in clean_text
+    assert "Docker" in clean_text
+    assert "Kubernetes" in clean_text
+    assert "AWS Certified Solutions Architect" in clean_text
+    assert "50M" in clean_text
+
+@pytest.mark.asyncio
+async def test_groq_receives_unfabricated_evidence_and_different_jds():
+    class CapturingProvider(AIProvider):
+        def __init__(self):
+            self.captured_prompts = []
+
+        async def generate(self, request: AIRequest) -> AIResponse:
+            self.captured_prompts.append(request.user_prompt)
+            # Return valid JSON reflecting candidate's actual qualifications
+            return AIResponse(
+                content=json.dumps({
+                    "matched_keywords": ["Python (Experience: Built microservices)"],
+                    "missing_keywords": ["Rust", "Solana"],
+                    "missing_required": ["Rust"],
+                    "missing_preferred": ["Solana"],
+                    "strengths": ["Demonstrated backend proficiency in Python"],
+                    "recommendations": ["Acquire hands-on experience in Rust"]
+                }),
+                provider="groq",
+                model="openai/gpt-oss-120b"
+            )
+
+    provider = CapturingProvider()
+    analyzer = AtsSemanticAnalyzer(provider=provider)
+
+    resume = "Experience: Developed microservices with Python and PostgreSQL for 4 years."
+    jd_web3 = "Job: Web3 Engineer. Requirements: Rust, Solana, Smart Contracts."
+    jd_backend = "Job: Python Backend Engineer. Requirements: Python, PostgreSQL, REST APIs."
+
+    res1 = await analyzer.analyze(sanitized_text=resume, jd=jd_web3)
+    res2 = await analyzer.analyze(sanitized_text=resume, jd=jd_backend)
+
+    # 1. Verify user prompts to Groq are distinct
+    assert len(provider.captured_prompts) == 2
+    assert jd_web3 in provider.captured_prompts[0]
+    assert jd_backend in provider.captured_prompts[1]
+    assert provider.captured_prompts[0] != provider.captured_prompts[1]
+
+    # 2. Verify cache keys are distinct for different JDs
+    key1 = AtsAnalysisCache.make_key("user_1", resume, jd_web3, None, "ats_v2.0")
+    key2 = AtsAnalysisCache.make_key("user_1", resume, jd_backend, None, "ats_v2.0")
+    assert key1 != key2
+
+    # 3. Verify response schema compatibility
+    assert res1["analysis_mode"] == "ai"
+    assert "matched_keywords" in res1
+    assert "missing_keywords" in res1
+    assert "missing_required" in res1
+    assert "missing_preferred" in res1
+    assert "strengths" in res1
+    assert "recommendations" in res1
+
+

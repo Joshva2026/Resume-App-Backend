@@ -10,7 +10,8 @@ class AtsAnalysisCache:
     target role, scoring version, or user changes.
     """
     _cache: Dict[str, Tuple[float, AtsReport]] = {}
-    TTL_SECONDS = 600  # 10 minutes
+    TTL_SECONDS = 600.0  # 10 minutes default for successful AI reports
+    FALLBACK_TTL_SECONDS = 15.0  # 15 seconds transient debounce for fallback results
     MAX_ENTRIES = 500
 
     @classmethod
@@ -32,19 +33,28 @@ class AtsAnalysisCache:
     def get(cls, key: str) -> Optional[AtsReport]:
         now = time.time()
         if key in cls._cache:
-            ts, report = cls._cache[key]
-            if now - ts <= cls.TTL_SECONDS:
+            expiry, report = cls._cache[key]
+            if now <= expiry:
                 return report
             else:
                 del cls._cache[key]
         return None
 
     @classmethod
-    def set(cls, key: str, report: AtsReport) -> None:
+    def set(cls, key: str, report: AtsReport, ttl_seconds: Optional[float] = None) -> None:
         if len(cls._cache) >= cls.MAX_ENTRIES:
             oldest_key = min(cls._cache.keys(), key=lambda k: cls._cache[k][0])
             del cls._cache[oldest_key]
-        cls._cache[key] = (time.time(), report)
+        
+        # If no explicit TTL is specified, use short TTL for fallback and full TTL for AI
+        if ttl_seconds is None:
+            if report.analysis_mode == "deterministic_fallback" or not report.semantic_analysis_available:
+                ttl_seconds = cls.FALLBACK_TTL_SECONDS
+            else:
+                ttl_seconds = cls.TTL_SECONDS
+
+        expiry = time.time() + ttl_seconds
+        cls._cache[key] = (expiry, report)
 
     @classmethod
     def clear(cls) -> None:

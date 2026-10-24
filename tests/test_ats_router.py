@@ -97,10 +97,13 @@ def test_analyze_provider_timeout_fallback():
     app.dependency_overrides[get_supabase_client] = mock_get_db
 
     from app.services.ai_provider import ProviderTimeoutError
-    from app.services.nvidia_provider import NvidiaAIProvider
+    from app.services.groq_provider import GroqAIProvider
+    from app.services.grok_provider import XAIGrokAIProvider
 
-    with patch.object(NvidiaAIProvider, 'generate', new_callable=AsyncMock) as mock_generate:
-        mock_generate.side_effect = ProviderTimeoutError("The AI response took too long. Please try again.")
+    with patch.object(GroqAIProvider, 'generate', new_callable=AsyncMock) as mock_groq, \
+         patch.object(XAIGrokAIProvider, 'generate', new_callable=AsyncMock) as mock_grok:
+        mock_groq.side_effect = ProviderTimeoutError("The AI response took too long. Please try again.")
+        mock_grok.side_effect = ProviderTimeoutError("The AI response took too long. Please try again.")
 
         response = client.post("/ats/analyze", json={
             "document_id": "test_doc_timeout",
