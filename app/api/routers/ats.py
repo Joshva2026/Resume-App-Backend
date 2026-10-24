@@ -7,6 +7,8 @@ from app.schemas.ats import AtsParseResponse, AtsAnalyzeRequest, AtsReport
 from app.services.ats_parser import AtsParser
 from app.services.ats_scorer import AtsScorer
 from app.services.ats_semantic_analyzer import AtsSemanticAnalyzer
+from app.services.ats_cache import AtsAnalysisCache
+from app.services.ats_privacy import ResumePrivacyRedactor
 from app.services.nvidia_provider import NvidiaAIProvider
 from app.api.routers.ai import check_rate_limit
 from app.api.deps import get_current_user_id, get_supabase_client
@@ -223,8 +225,22 @@ async def analyze_resume(
     
     if len(sanitized_text) < 50:
         raise HTTPException(status_code=422, detail="Document contains insufficient content for analysis")
+
+    # 2. Cache Lookup
+    # Isolated by user_id, sanitized resume text fingerprint, job description, target role, and scoring version
+    cache_key = AtsAnalysisCache.make_key(
+        user_id=user_id,
+        resume_text=sanitized_text,
+        job_description=analyze_req.job_description,
+        target_role=analyze_req.target_role,
+        scoring_version=scorer.SCORING_VERSION
+    )
+    cached_report = AtsAnalysisCache.get(cache_key)
+    if cached_report:
+        logger.info(f"ATS cache hit for user={user_id} doc={analyze_req.document_id}")
+        return cached_report
         
-    # 2. Deterministic Scoring
+    # 3. Dynamic Deterministic Scoring
     score_result = scorer.calculate_score(
         sanitized_text, 
         analyze_req.job_description, 
@@ -232,7 +248,7 @@ async def analyze_resume(
         parsed_structure=parsed_structure
     )
     
-    # 3. AI Semantic Analysis (with deterministic fallback)
+    # 4. AI Semantic Analysis (with deterministic fallback)
     provider = NvidiaAIProvider()
     analyzer = AtsSemanticAnalyzer(provider)
     semantic_result = await analyzer.analyze(
@@ -243,23 +259,30 @@ async def analyze_resume(
         parsed_structure=parsed_structure
     )
     
+    keyword_map = {
+        "matched": semantic_result.get("matched_keywords", []),
+        "missing": semantic_result.get("missing_keywords", []),
+        "missing_required": semantic_result.get("missing_required", []),
+        "missing_preferred": semantic_result.get("missing_preferred", [])
+    }
+
     report = AtsReport(
         ats_document_id=analyze_req.document_id,
         target_role=analyze_req.target_role,
         overall_score=score_result["overall"],
         section_scores=score_result["sections"],
-        keyword_analysis={
-            "matched": semantic_result["matched_keywords"],
-            "missing": semantic_result["missing_keywords"]
-        },
-        recommendations=semantic_result["recommendations"],
-        strengths=semantic_result["strengths"],
+        keyword_analysis=keyword_map,
+        recommendations=semantic_result.get("recommendations", []),
+        strengths=semantic_result.get("strengths", []),
         semantic_analysis_available=semantic_result.get("semantic_analysis_available", True),
         semantic_error=semantic_result.get("semantic_error"),
         analysis_mode=semantic_result.get("analysis_mode", "ai")
     )
+
+    # 5. Store in isolated cache
+    AtsAnalysisCache.set(cache_key, report)
     
-    # Persist report safely
+    # 6. Persist report safely
     try:
         report_data = {
             "user_id": user_id,
@@ -268,12 +291,9 @@ async def analyze_resume(
             "job_description": analyze_req.job_description,
             "overall_score": score_result["overall"],
             "section_scores": score_result["sections"],
-            "keyword_analysis": {
-                "matched": semantic_result["matched_keywords"],
-                "missing": semantic_result["missing_keywords"]
-            },
-            "recommendations": semantic_result["recommendations"],
-            "strengths": semantic_result["strengths"]
+            "keyword_analysis": keyword_map,
+            "recommendations": semantic_result.get("recommendations", []),
+            "strengths": semantic_result.get("strengths", [])
         }
         try:
             supabase.table("ats_reports").insert(report_data).execute()

@@ -1,7 +1,10 @@
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 import re
+from app.services.ats_privacy import ResumePrivacyRedactor
 
 class AtsScorer:
+    SCORING_VERSION = "ats_v2.0"
+
     # Curated technical and professional skills dictionary with proper casing and alias mappings
     SKILL_MAP = {
         "python": "Python", "java": "Java", "javascript": "JavaScript", "typescript": "TypeScript",
@@ -111,83 +114,172 @@ class AtsScorer:
 
     def sanitize_for_scoring(self, parsed_structure: Dict[str, Any]) -> str:
         """
-        Extracts only the body text for scoring, explicitly dropping 'personal_info'.
-        Includes section headings so scoring models recognize structured sections clearly.
+        Sanitizes resume structure for scoring and provider transmission.
+        Completely drops personal identifying information (PII) using ResumePrivacyRedactor.
+        Preserves all professional qualifications, technical skills, metrics, and experience.
         """
-        body_parts = []
-        for key, value in parsed_structure.items():
-            if key != "personal_info" and isinstance(value, str) and value.strip():
-                heading = key.replace('_', ' ').title()
-                body_parts.append(f"{heading}:\n{value.strip()}")
-        
-        return "\n\n".join(body_parts)
+        redactor = ResumePrivacyRedactor()
+        return redactor.build_sanitized_resume_prompt_text(parsed_structure)
+
+    def extract_jd_requirements(self, jd: str) -> Dict[str, Any]:
+        """
+        Parses the job description to extract required skills, preferred skills,
+        and domain technology keywords based on contextual sections.
+        """
+        if not jd or not jd.strip():
+            return {
+                "required_skills": [],
+                "preferred_skills": [],
+                "all_skills": []
+            }
+
+        jd_lower = jd.lower()
+
+        # Split JD into sections if present
+        # Detect sections like "Requirements", "Must Have", "Minimum Qualifications"
+        # vs "Preferred", "Nice to Have", "Bonus", "Desired"
+        required_patterns = [
+            r'(?:requirements|required|must\s+have|minimum\s+qualifications|basic\s+qualifications|what\s+you(?:\'ll)?\s+need)([\s\S]*?)(?:preferred|nice\s+to\s+have|bonus|plus|desired|what\s+we\s+offer|benefits|$)',
+        ]
+        preferred_patterns = [
+            r'(?:preferred|nice\s+to\s+have|bonus|plus|desired|additional\s+qualifications)([\s\S]*?)(?:what\s+we\s+offer|benefits|about\s+us|$)'
+        ]
+
+        req_section_text = ""
+        for pat in required_patterns:
+            m = re.search(pat, jd_lower)
+            if m:
+                req_section_text = m.group(1)
+                break
+
+        pref_section_text = ""
+        for pat in preferred_patterns:
+            m = re.search(pat, jd_lower)
+            if m:
+                pref_section_text = m.group(1)
+                break
+
+        all_detected_skills: List[str] = []
+        required_skills: List[str] = []
+        preferred_skills: List[str] = []
+
+        for skill_key, skill_display in self.SKILL_MAP.items():
+            pattern = self._skill_regex(skill_key)
+            if re.search(pattern, jd_lower):
+                if skill_display not in all_detected_skills:
+                    all_detected_skills.append(skill_display)
+
+                # Check if skill specifically falls in preferred or required text
+                if pref_section_text and re.search(pattern, pref_section_text):
+                    if skill_display not in preferred_skills:
+                        preferred_skills.append(skill_display)
+                elif req_section_text and re.search(pattern, req_section_text):
+                    if skill_display not in required_skills:
+                        required_skills.append(skill_display)
+
+        # If no explicit sections were parsed, classify skills sensibly:
+        # Core skills listed first are required; secondary/extra skills are preferred
+        if not required_skills and not preferred_skills and all_detected_skills:
+            if len(all_detected_skills) <= 4:
+                required_skills = list(all_detected_skills)
+                preferred_skills = []
+            else:
+                cutoff = max(2, int(len(all_detected_skills) * 0.65))
+                required_skills = all_detected_skills[:cutoff]
+                preferred_skills = all_detected_skills[cutoff:]
+        elif not required_skills and all_detected_skills:
+            required_skills = [s for s in all_detected_skills if s not in preferred_skills]
+
+        return {
+            "required_skills": required_skills,
+            "preferred_skills": preferred_skills,
+            "all_skills": all_detected_skills
+        }
+
+    def extract_skill_evidence(
+        self,
+        parsed_structure: Optional[Dict[str, Any]],
+        text: str,
+        skill_key: str,
+        skill_display: str
+    ) -> Optional[str]:
+        """
+        Extracts actual resume evidence for a matched skill (which section and sentence snippet).
+        """
+        pattern = self._skill_regex(skill_key)
+
+        # 1. Search structured sections in order of evidence strength: experience, projects, summary, skills
+        if parsed_structure:
+            for sec_name in ["experience", "projects", "summary", "skills", "certifications"]:
+                sec_val = parsed_structure.get(sec_name)
+                if isinstance(sec_val, str) and sec_val.strip():
+                    lines = [l.strip() for l in sec_val.split("\n") if l.strip()]
+                    for line in lines:
+                        if re.search(pattern, line.lower()):
+                            clean_line = re.sub(r'^[•\-\*#\d\.\s]+', '', line).strip()
+                            if len(clean_line) > 85:
+                                clean_line = clean_line[:82] + "..."
+                            return f"{sec_name.title()}: {clean_line}"
+
+        # 2. Fallback to unstructured text search
+        for line in text.split("\n"):
+            line_str = line.strip()
+            if line_str and re.search(pattern, line_str.lower()):
+                clean_line = re.sub(r'^[•\-\*#\d\.\s]+', '', line_str).strip()
+                if len(clean_line) > 85:
+                    clean_line = clean_line[:82] + "..."
+                return f"Resume: {clean_line}"
+
+        return None
 
     def _extract_achievement_metrics(self, text: str) -> List[str]:
         """
         Identifies genuine quantitative results: percentages, currency, multipliers, scale indicators,
-        and outcome statements. Explicitly ignores calendar years (19xx, 20xx), dates, phone numbers,
-        version numbers, and zip codes.
+        and outcome statements. Explicitly ignores calendar years, dates, phone numbers, and zip codes.
         """
-        # Step 1: Strip obvious date ranges, 4-digit calendar years, phone numbers, and version numbers
-        # to avoid false positive counting
         cleaned = text
-        # Remove phone numbers e.g. 555-0199, (555) 012-3456
         cleaned = re.sub(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', ' [PHONE] ', cleaned)
-        # Remove date ranges e.g. 2018 - 2023, 2018-present
         cleaned = re.sub(r'\b(?:19|20)\d{2}\s*[-–—to/]\s*(?:(?:19|20)\d{2}|present|current)\b', ' [DATERANGE] ', cleaned, flags=re.IGNORECASE)
-        # Remove standalone calendar years (1900-2099)
         cleaned = re.sub(r'\b(?:19|20)\d{2}\b', ' [YEAR] ', cleaned)
-        # Remove version strings e.g. v3.2.1 or version 2.0
         cleaned = re.sub(r'\b(?:v|version)?\s*\d+\.\d+(?:\.\d+)?\b', ' [VERSION] ', cleaned, flags=re.IGNORECASE)
 
         metrics = []
-
-        # 1. Percentages (e.g. 45%, 99.9%, 20 %)
         for m in re.finditer(r'\b\d+(?:\.\d+)?\s*%', cleaned):
             metrics.append(m.group(0))
-
-        # 2. Currency gains or savings (e.g. $2M, $500K, $10,000, 50K dollars)
         for m in re.finditer(r'\$\s*\d+(?:,\d{3})*(?:\.\d+)?\s*[kKmMbB]?\b|\b\d+(?:\.\d+)?\s*[kKmMbB]?\s*dollars?\b', cleaned):
             metrics.append(m.group(0))
-
-        # 3. Multipliers (e.g. 10x, 3x faster, 2.5x throughput)
         for m in re.finditer(r'\b\d+(?:\.\d+)?x\b', cleaned, flags=re.IGNORECASE):
             metrics.append(m.group(0))
-
-        # 4. Scale volumes (e.g. 50M records, 100k users, 2 million events)
         for m in re.finditer(r'\b\d+(?:\.\d+)?\s*(?:k|m|million|billion|thousand)\b', cleaned, flags=re.IGNORECASE):
             metrics.append(m.group(0))
-
-        # 5. Quantified performance or team size in context
-        # e.g. "team of 6 engineers", "led 8 developers", "reduced latency by 120ms"
         for m in re.finditer(r'\b(?:team of|managed|led|supervised)\s+(\d+)\b', cleaned, flags=re.IGNORECASE):
             metrics.append(m.group(0))
-            
         for m in re.finditer(r'\b(?:reduced|saved|cut|improved|uptime of)\s+[^.\n,;]*?(\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|minutes?|hours?|days?))\b', cleaned, flags=re.IGNORECASE):
             metrics.append(m.group(0))
 
         return metrics
 
     def calculate_score(
-        self, 
-        text: str, 
-        jd: Optional[str] = None, 
+        self,
+        text: str,
+        jd: Optional[str] = None,
         target_role: Optional[str] = None,
         parsed_structure: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Deterministic 100-point multi-factor scoring model.
-        Accurately verifies section presence using parsed_structure or explicit headings.
-        Eliminates false metric counting and substring verb false positives.
+        Deterministic, explainable 100-point multi-factor scoring model.
+        When a job description is supplied, scoring is directly anchored to that job's
+        required and preferred qualifications (Required 30%, Preferred 15%, Experience 20%,
+        Projects 10%, Education 10%, Readability 15%).
+        Different job descriptions produce independently calculated results.
+        Identical inputs produce identical scores.
         """
         text_lower = text.lower()
-        score = 0.0
         section_scores: Dict[str, Optional[int]] = {}
 
         # -------------------------------------------------------------
-        # 1. Section Completeness / Presence (15%)
+        # 1. Section Completeness / Presence
         # -------------------------------------------------------------
-        # Check both parsed_structure (if passed) and text boundaries
         def check_section(sec_name: str, patterns: List[str]) -> bool:
             if parsed_structure and bool(parsed_structure.get(sec_name, "").strip()):
                 return True
@@ -205,14 +297,11 @@ class AtsScorer:
 
         found_core = sum([1 for x in [has_exp, has_edu, has_skills] if x])
         found_opt = sum([1 for x in [has_projects, has_certs, has_summary] if x])
-
-        # 3 core sections = 75 pts. 1 opt = 85, 2 opt = 95, 3 opt = 100
         completeness = min(100, (found_core * 25) + (found_opt * 10))
         section_scores["Completeness"] = completeness
-        score += completeness * 0.15
 
         # -------------------------------------------------------------
-        # 2. Experience / Action Verbs & True Metrics (20%)
+        # 2. Experience, Action Verbs & Metrics
         # -------------------------------------------------------------
         action_verbs = [
             "developed", "managed", "led", "created", "designed", "implemented",
@@ -220,50 +309,25 @@ class AtsScorer:
             "delivered", "automated", "streamlined", "scaled", "spearheaded",
             "orchestrated", "executed", "collaborated"
         ]
-        # Use word boundaries so "led" does NOT match "handled", "scheduled", "compiled"
         verb_count = sum(1 for v in action_verbs if re.search(r'\b' + re.escape(v) + r'\b', text_lower))
-        
-        # Genuine achievement metrics
         achievement_metrics = self._extract_achievement_metrics(text)
         metrics_count = len(achievement_metrics)
 
-        # Baseline experience has points from structure if experience exists
-        exp_base = 20 if has_exp else 0
+        exp_base = 25 if has_exp else 0
         exp_score = min(100, exp_base + (verb_count * 10) + (metrics_count * 15))
         section_scores["Experience"] = exp_score
-        score += exp_score * 0.20
 
         # -------------------------------------------------------------
-        # 3. Relevant Skills & Technologies (15%)
+        # 3. Detect Skills Present in Candidate Resume
         # -------------------------------------------------------------
-        detected_skills = set()
+        detected_skills: Set[str] = set()
         for skill_key, skill_display in self.SKILL_MAP.items():
             pattern = self._skill_regex(skill_key)
             if re.search(pattern, text_lower):
                 detected_skills.add(skill_display)
 
-        # If JD is provided, skill score reflects JD skill match density
-        jd_skills_in_jd = set()
-        if jd and jd.strip():
-            jd_lower = jd.lower()
-            for skill_key, skill_display in self.SKILL_MAP.items():
-                pattern = self._skill_regex(skill_key)
-                if re.search(pattern, jd_lower):
-                    jd_skills_in_jd.add(skill_display)
-
-        if jd_skills_in_jd:
-            matched_jd_skills = detected_skills.intersection(jd_skills_in_jd)
-            jd_skill_ratio = len(matched_jd_skills) / max(1, len(jd_skills_in_jd))
-            skill_score = min(100, int(jd_skill_ratio * 100))
-        else:
-            # General tech density (7+ skills = 100%)
-            skill_score = min(100, len(detected_skills) * 15)
-
-        section_scores["Skills"] = skill_score
-        score += skill_score * 0.15
-
         # -------------------------------------------------------------
-        # 4. Projects (10%)
+        # 4. Projects Score
         # -------------------------------------------------------------
         if has_projects:
             project_score = 100
@@ -272,96 +336,136 @@ class AtsScorer:
         else:
             project_score = 0
         section_scores["Projects"] = project_score
-        score += project_score * 0.10
 
         # -------------------------------------------------------------
-        # 5. Education / Qualifications (10%)
+        # 5. Education & Certifications Score
         # -------------------------------------------------------------
         edu_score = 100 if has_edu else 0
         section_scores["Education"] = edu_score
-        score += edu_score * 0.10
 
-        # -------------------------------------------------------------
-        # 6. Certifications / Achievements (5%)
-        # -------------------------------------------------------------
         cert_score = 100 if has_certs else (50 if re.search(r'\b(certified|certification|aws|gcp|azure|pmp|cissp)\b', text_lower) else 0)
         section_scores["Certifications"] = cert_score
-        score += cert_score * 0.05
 
         # -------------------------------------------------------------
-        # 7. Target Role Alignment (10%)
-        # -------------------------------------------------------------
-        if target_role and target_role.strip():
-            role_tokens = [w for w in re.findall(r'\b\w+\b', target_role.lower()) if w not in self.COMMON_STOPWORDS and len(w) > 2]
-            if role_tokens:
-                overlap = sum(1 for w in role_tokens if re.search(r'\b' + re.escape(w) + r'\b', text_lower))
-                role_score = min(100, int((overlap / len(role_tokens)) * 100))
-            else:
-                role_score = 100
-            section_scores["Target Role"] = role_score
-            score += role_score * 0.10
-        else:
-            section_scores["Target Role"] = None
-
-        # -------------------------------------------------------------
-        # 8. Job Description Match Score (10%)
-        # -------------------------------------------------------------
-        if jd and jd.strip():
-            # 1. Technical Skills match component (50%)
-            if jd_skills_in_jd:
-                matched_jd_skills = detected_skills.intersection(jd_skills_in_jd)
-                skills_match_ratio = len(matched_jd_skills) / max(1, len(jd_skills_in_jd))
-            else:
-                skills_match_ratio = min(1.0, len(detected_skills) / 5.0)
-
-            # 2. Key requirements/domain keywords match (35%)
-            jd_keywords = set()
-            for token in re.findall(r'\b[A-Za-z][A-Za-z0-9+#.-]{2,18}\b', jd):
-                token_lower = token.lower()
-                if token_lower not in self.COMMON_STOPWORDS and len(token) > 2:
-                    jd_keywords.add(token_lower)
-
-            if jd_keywords:
-                matched_kw = sum(1 for kw in jd_keywords if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
-                # Reasonable density factor: matching 40%+ of unique keywords represents a strong match
-                keyword_ratio = min(1.0, (matched_kw / len(jd_keywords)) * 2.2)
-            else:
-                keyword_ratio = 1.0
-
-            # 3. Experience & Education alignment (15%)
-            context_match = 0.5
-            if has_exp:
-                context_match += 0.3
-            if has_edu:
-                context_match += 0.2
-            context_match = min(1.0, context_match)
-
-            jd_total = (skills_match_ratio * 50) + (keyword_ratio * 35) + (context_match * 15)
-            jd_score = min(100, max(0, int(round(jd_total))))
-            section_scores["JD Match"] = jd_score
-            score += jd_score * 0.10
-        else:
-            section_scores["JD Match"] = None
-
-        # -------------------------------------------------------------
-        # 9. ATS Readability / Formatting (5%)
+        # 6. Readability / Formatting
         # -------------------------------------------------------------
         lines = text.split("\n")
         non_empty_lines = len([l for l in lines if l.strip()])
-        readability = 100 if 10 <= non_empty_lines <= 250 else 60
+        readability = 100 if 10 <= non_empty_lines <= 250 else 65
         section_scores["Readability"] = readability
-        score += readability * 0.05
 
         # -------------------------------------------------------------
-        # Weight Redistribution for Omitted Role / JD
+        # 7. Job-Specific Evaluation (When JD is provided)
         # -------------------------------------------------------------
-        used_weight = 1.0
-        if not target_role:
-            used_weight -= 0.10
-        if not jd:
-            used_weight -= 0.10
+        has_jd = bool(jd and jd.strip())
+        if has_jd:
+            jd_reqs = self.extract_jd_requirements(jd or "")
+            req_skills = set(jd_reqs["required_skills"])
+            pref_skills = set(jd_reqs["preferred_skills"])
 
-        final_score = min(100, max(0, int(round(score * (1.0 / used_weight)))))
+            # Required skill coverage (0 to 100)
+            if req_skills:
+                matched_req = detected_skills.intersection(req_skills)
+                req_coverage_score = int(round((len(matched_req) / len(req_skills)) * 100))
+            else:
+                # If no specific required skills in taxonomy, check general skill density
+                req_coverage_score = min(100, len(detected_skills) * 15)
+
+            # Preferred skill coverage (0 to 100)
+            if pref_skills:
+                matched_pref = detected_skills.intersection(pref_skills)
+                pref_coverage_score = int(round((len(matched_pref) / len(pref_skills)) * 100))
+            else:
+                # If no preferred skills specified in JD, tie preferred coverage directly to required match
+                pref_coverage_score = req_coverage_score
+
+            # Domain keyword match from JD text
+            jd_keywords = set()
+            for token in re.findall(r'\b[A-Za-z][A-Za-z0-9+#.-]{2,18}\b', jd or ""):
+                t_low = token.lower()
+                if t_low not in self.COMMON_STOPWORDS and len(token) > 2:
+                    jd_keywords.add(t_low)
+
+            if jd_keywords:
+                matched_kw = sum(1 for kw in jd_keywords if re.search(r'\b' + re.escape(kw) + r'\b', text_lower))
+                keyword_match_ratio = min(1.0, (matched_kw / len(jd_keywords)) * 2.0)
+            else:
+                keyword_match_ratio = 1.0
+
+            # Technical Skills Section Score: combines required & preferred coverage
+            overall_skill_score = int(round((req_coverage_score * 0.70) + (pref_coverage_score * 0.30)))
+            section_scores["Skills"] = overall_skill_score
+
+            # JD Match metric: combines required skills (50%), preferred (25%), keywords (25%)
+            jd_match_pct = int(round((req_coverage_score * 0.50) + (pref_coverage_score * 0.25) + (keyword_match_ratio * 25.0)))
+            section_scores["JD Match"] = min(100, max(0, jd_match_pct))
+
+            # Role Alignment
+            if target_role and target_role.strip():
+                role_tokens = [w for w in re.findall(r'\b\w+\b', target_role.lower()) if w not in self.COMMON_STOPWORDS and len(w) > 2]
+                if role_tokens:
+                    overlap = sum(1 for w in role_tokens if re.search(r'\b' + re.escape(w) + r'\b', text_lower))
+                    role_score = min(100, int((overlap / len(role_tokens)) * 100))
+                else:
+                    role_score = 100
+                section_scores["Target Role"] = role_score
+            else:
+                section_scores["Target Role"] = None
+
+            # DYNAMIC WEIGHTED SCORING FORMULA (Anchored to Job Requirements):
+            # Required Skill Coverage: 30%
+            # Preferred Skills / Stack: 15%
+            # Experience & Impact: 20%
+            # Project Alignment: 10%
+            # Education & Certifications: 10%
+            # ATS Structure & Readability: 15%
+            edu_cert_combined = (edu_score * 0.6) + (cert_score * 0.4)
+            ats_combined = (completeness * 0.65) + (readability * 0.35)
+
+            final_calculated = (
+                (req_coverage_score * 0.30) +
+                (pref_coverage_score * 0.15) +
+                (exp_score * 0.20) +
+                (project_score * 0.10) +
+                (edu_cert_combined * 0.10) +
+                (ats_combined * 0.15)
+            )
+
+            # Bonus for strong role alignment if specified
+            if section_scores["Target Role"] is not None:
+                role_bonus = (section_scores["Target Role"] - 50) * 0.05
+                final_calculated += role_bonus
+
+            final_score = min(100, max(15, int(round(final_calculated))))
+
+        else:
+            # General Baseline Resume Audit (No Job Description provided)
+            skill_score = min(100, len(detected_skills) * 15)
+            section_scores["Skills"] = skill_score
+            section_scores["JD Match"] = None
+
+            if target_role and target_role.strip():
+                role_tokens = [w for w in re.findall(r'\b\w+\b', target_role.lower()) if w not in self.COMMON_STOPWORDS and len(w) > 2]
+                if role_tokens:
+                    overlap = sum(1 for w in role_tokens if re.search(r'\b' + re.escape(w) + r'\b', text_lower))
+                    role_score = min(100, int((overlap / len(role_tokens)) * 100))
+                else:
+                    role_score = 100
+                section_scores["Target Role"] = role_score
+            else:
+                section_scores["Target Role"] = None
+
+            # Weights: Completeness 20%, Experience 25%, Skills 20%, Projects 15%, Edu/Certs 10%, Readability 10%
+            edu_cert_combined = (edu_score * 0.6) + (cert_score * 0.4)
+            final_calculated = (
+                (completeness * 0.20) +
+                (exp_score * 0.25) +
+                (skill_score * 0.20) +
+                (project_score * 0.15) +
+                (edu_cert_combined * 0.10) +
+                (readability * 0.10)
+            )
+            final_score = min(100, max(20, int(round(final_calculated))))
 
         return {
             "overall": final_score,
@@ -377,58 +481,57 @@ class AtsScorer:
         parsed_structure: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Extracts verified matched/missing keywords, strengths, and actionable
-        recommendations deterministically from resume text and job description/role.
-        Never fabricates skills or credentials. Strictly filters generic stopwords.
+        Calculates matched keywords with resume evidence, missing required/preferred skills,
+        and job-specific recommendations deterministically from resume and job description.
+        Distinguishes missing required skills from preferred skills.
+        Clearly labels output as deterministic fallback.
         """
         text_lower = text.lower()
         if section_scores is None:
             section_scores = self.calculate_score(text, jd, target_role, parsed_structure=parsed_structure)["sections"]
 
         matched_keywords: List[str] = []
+        matched_with_evidence: List[str] = []
+        missing_required: List[str] = []
+        missing_preferred: List[str] = []
         missing_keywords: List[str] = []
+
         matched_seen = set()
         missing_seen = set()
 
         if jd and jd.strip():
-            jd_lower = jd.lower()
-            # 1. Match known skills from taxonomy
-            for skill_key, skill_display in self.SKILL_MAP.items():
-                pattern = self._skill_regex(skill_key)
-                if re.search(pattern, jd_lower):
-                    if re.search(pattern, text_lower):
-                        if skill_display not in matched_seen:
-                            matched_keywords.append(skill_display)
-                            matched_seen.add(skill_display)
-                    else:
-                        if skill_display not in missing_seen:
-                            missing_keywords.append(skill_display)
-                            missing_seen.add(skill_display)
+            jd_reqs = self.extract_jd_requirements(jd)
+            req_skills = jd_reqs["required_skills"]
+            pref_skills = jd_reqs["preferred_skills"]
+            all_jd_skills = jd_reqs["all_skills"]
 
-            # 2. Extract technical acronyms or specific technical candidate tokens (all-caps acronyms e.g. SDK, RPC)
-            jd_tokens = set(re.findall(r'\b[A-Za-z][A-Za-z0-9+#.-]{1,18}\b', jd))
-            for token in jd_tokens:
-                token_lower = token.lower()
-                if (
-                    token_lower in self.COMMON_STOPWORDS 
-                    or len(token) < 3 
-                    or token_lower in self.SKILL_MAP
-                    or any(s.lower() == token_lower for s in matched_seen)
-                    or any(s.lower() == token_lower for s in missing_seen)
-                ):
-                    continue
+            # Map display name to key
+            disp_to_key = {}
+            for k, v in self.SKILL_MAP.items():
+                if v not in disp_to_key:
+                    disp_to_key[v] = k
 
-                # Only include terms that are explicitly all-caps acronyms or recognized technical terms
-                is_technical_candidate = token.isupper() and 2 <= len(token) <= 5
-                if is_technical_candidate:
-                    if re.search(r'\b' + re.escape(token_lower) + r'\b', text_lower):
-                        if token not in matched_seen and len(matched_keywords) < 8:
-                            matched_keywords.append(token)
-                            matched_seen.add(token)
-                    else:
-                        if token not in missing_seen and len(missing_keywords) < 8:
-                            missing_keywords.append(token)
-                            missing_seen.add(token)
+            for skill_disp in all_jd_skills:
+                skill_k = disp_to_key.get(skill_disp, skill_disp.lower())
+                pat = self._skill_regex(skill_k)
+
+                if re.search(pat, text_lower):
+                    if skill_disp not in matched_seen:
+                        matched_keywords.append(skill_disp)
+                        evidence = self.extract_skill_evidence(parsed_structure, text, skill_k, skill_disp)
+                        if evidence:
+                            matched_with_evidence.append(f"{skill_disp} ({evidence})")
+                        else:
+                            matched_with_evidence.append(skill_disp)
+                        matched_seen.add(skill_disp)
+                else:
+                    if skill_disp not in missing_seen:
+                        missing_seen.add(skill_disp)
+                        missing_keywords.append(skill_disp)
+                        if skill_disp in req_skills:
+                            missing_required.append(skill_disp)
+                        else:
+                            missing_preferred.append(skill_disp)
 
         elif target_role and target_role.strip():
             role_lower = target_role.lower()
@@ -437,9 +540,10 @@ class AtsScorer:
                 if re.search(pattern, text_lower):
                     if skill_display not in matched_seen:
                         matched_keywords.append(skill_display)
+                        evidence = self.extract_skill_evidence(parsed_structure, text, skill_key, skill_display)
+                        matched_with_evidence.append(f"{skill_display} ({evidence})" if evidence else skill_display)
                         matched_seen.add(skill_display)
 
-            # If target role words are missing from resume (excluding stopwords)
             for word in re.findall(r'\b\w+\b', role_lower):
                 if len(word) > 2 and word not in self.COMMON_STOPWORDS and not re.search(r'\b' + re.escape(word) + r'\b', text_lower):
                     display = word.capitalize()
@@ -447,16 +551,18 @@ class AtsScorer:
                         missing_keywords.append(display)
                         missing_seen.add(display)
         else:
-            # No JD and no target role: extract detected resume skills only, missing is empty
+            # Baseline detection
             for skill_key, skill_display in self.SKILL_MAP.items():
                 pattern = self._skill_regex(skill_key)
                 if re.search(pattern, text_lower):
                     if skill_display not in matched_seen:
                         matched_keywords.append(skill_display)
+                        evidence = self.extract_skill_evidence(parsed_structure, text, skill_key, skill_display)
+                        matched_with_evidence.append(f"{skill_display} ({evidence})" if evidence else skill_display)
                         matched_seen.add(skill_display)
             missing_keywords = []
 
-        # 3. Grounded Strengths
+        # Grounded Strengths
         strengths: List[str] = []
         action_verbs = [
             "developed", "managed", "led", "created", "designed", "implemented",
@@ -466,11 +572,11 @@ class AtsScorer:
         achievement_metrics = self._extract_achievement_metrics(text)
 
         if len(achievement_metrics) >= 1 and verb_count >= 2:
-            strengths.append("Measurable achievements included with quantifiable metrics and action verbs.")
+            strengths.append(f"Includes quantifiable achievements ({', '.join(achievement_metrics[:2])}) with action verbs.")
         if section_scores.get("Completeness", 0) >= 75:
             strengths.append("Standard ATS section structure present (Experience, Education, Skills).")
         if len(matched_keywords) >= 3:
-            strengths.append(f"Identified {len(matched_keywords)} verified industry-relevant technical competencies.")
+            strengths.append(f"Demonstrates {len(matched_keywords)} verified competencies aligned with role requirements.")
         elif section_scores.get("Education", 0) == 100:
             strengths.append("Academic qualifications and degrees clearly formatted.")
         if section_scores.get("Projects", 0) == 100:
@@ -479,11 +585,14 @@ class AtsScorer:
         if not strengths:
             strengths.append("Document text parsed successfully with readable ATS section layout.")
 
-        # 4. Grounded Actionable Recommendations
+        # Grounded Actionable Recommendations
         recommendations: List[str] = []
-        if missing_keywords:
-            top_missing = ", ".join(missing_keywords[:3])
-            recommendations.append(f"Add priority target keywords to Skills or Experience: {top_missing}.")
+        if missing_required:
+            top_req = ", ".join(missing_required[:3])
+            recommendations.append(f"Target job requires {top_req}: add practical experience or projects demonstrating these.")
+        if missing_preferred:
+            top_pref = ", ".join(missing_preferred[:2])
+            recommendations.append(f"Incorporate preferred technologies ({top_pref}) to stand out against competing candidates.")
         if len(achievement_metrics) < 2:
             recommendations.append("Add measurable outcomes (percentages, performance gains, revenue) to experience bullets.")
         if verb_count < 3:
@@ -503,7 +612,10 @@ class AtsScorer:
             "semantic_error": "AI semantic analysis timed out. Displaying local deterministic keyword match and rule-based recommendations.",
             "analysis_mode": "deterministic_fallback",
             "matched_keywords": matched_keywords[:8],
+            "matched_with_evidence": matched_with_evidence[:8],
             "missing_keywords": missing_keywords[:8],
+            "missing_required": missing_required[:8],
+            "missing_preferred": missing_preferred[:8],
             "strengths": strengths[:3],
             "recommendations": recommendations[:5]
         }

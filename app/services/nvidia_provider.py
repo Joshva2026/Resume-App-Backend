@@ -454,21 +454,26 @@ class NvidiaAIProvider(AIProvider):
                 raise MalformedResponseError("No choices in provider response")
                 
             content = choices[0].get("message", {}).get("content")
+            finish_reason = choices[0].get("finish_reason")
+
             if not content:
-                # If content is None, check if reasoning/reasoning_content was provided
+                # If finish reason indicates truncation due to tokens, fail fast
+                if finish_reason in ["length", "max_tokens"]:
+                    logger.warning(f"NVIDIA response truncated due to length/max_tokens (finish_reason={finish_reason})")
+                    raise MalformedResponseError("NVIDIA response truncated due to length/max_tokens")
+
+                # If content is None/empty, check if reasoning/reasoning_content was provided
                 msg = choices[0].get("message", {})
                 reasoning = msg.get("reasoning") or msg.get("reasoning_content")
                 if reasoning:
-                    logger.warning("Provider returned content in reasoning field instead of content field.")
-                    content = reasoning
+                    logger.warning("Provider returned reasoning field without final content.")
+                    raise MalformedResponseError("Provider returned reasoning metadata without completed final content")
                 else:
                     raise MalformedResponseError("No content in provider response")
             
             # Remove <think>...</think> reasoning blocks if present
             import re
             content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-                
-            finish_reason = choices[0].get("finish_reason")
             
             usage_data = data.get("usage", {})
             usage = AIResponseUsage(
