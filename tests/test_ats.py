@@ -193,3 +193,26 @@ def test_missing_jd_behavior():
     assert res["sections"]["Target Role"] is None
     assert 0 <= res["overall"] <= 100
 
+def test_partially_parsed_resume_score_bounding():
+    scorer = AtsScorer()
+    # Partially parsed: only skills provided
+    partial_structure = {
+        "personal_info": [],
+        "skills": "Python, Docker, SQL",
+        "experience": "",
+        "education": "",
+        "projects": "",
+        "certifications": ""
+    }
+    sanitized = scorer.sanitize_for_scoring(partial_structure)
+    score_res = scorer.calculate_score(sanitized, parsed_structure=partial_structure)
+    
+    assert 0 <= score_res["overall"] <= 100
+    assert score_res["sections"]["Skills"] > 0
+    assert score_res["sections"]["Experience"] == 0
+    assert score_res["sections"]["Education"] == 0
+    assert score_res["sections"]["Projects"] == 0
+    assert score_res["sections"]["Certifications"] == 0
+    assert score_res["sections"]["Completeness"] < 50
+
+

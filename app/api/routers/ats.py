@@ -212,6 +212,8 @@ async def analyze_resume(
         if not doc_response.data:
             raise HTTPException(status_code=404, detail="Document not found or access denied")
         parsed_structure = doc_response.data[0]["parsed_structure"]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to fetch document")
     
