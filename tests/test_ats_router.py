@@ -128,3 +128,39 @@ def test_analyze_provider_timeout_fallback():
         assert 0 < report["overall_score"] < 100
         assert len(report["recommendations"]) > 0
         assert len(report["strengths"]) > 0
+
+def test_parse_saved_resume():
+    mock_db = MagicMock()
+    mock_db.table("resumes").select().eq().eq().execute.return_value = MagicMock(
+        data=[{"id": "res_123", "resume_name": "Software Engineer Resume", "professional_summary": "Experienced engineer."}]
+    )
+    mock_db.table("resume_sections").select().eq().order().execute.return_value = MagicMock(
+        data=[
+            {
+                "section_type": "experience",
+                "content": {"job_title": "Backend Dev", "company": "Tech Corp", "description": "Built Python APIs."}
+            },
+            {
+                "section_type": "skill",
+                "content": {"name": "Python"}
+            }
+        ]
+    )
+    mock_db.table("ats_documents").insert().execute.return_value = MagicMock(
+        data=[{"id": "new_doc_456"}]
+    )
+
+    def mock_get_db():
+        return mock_db
+
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    app.dependency_overrides[get_supabase_client] = mock_get_db
+
+    response = client.post("/ats/parse-resume/res_123")
+    assert response.status_code == 200
+    res_data = response.json()
+    assert res_data["document_id"] == "new_doc_456"
+    assert res_data["file_name"] == "Software Engineer Resume.pdf"
+    assert "experience" in res_data["parsed_structure"]
+    assert "Backend Dev at Tech Corp" in res_data["parsed_structure"]["experience"]
+

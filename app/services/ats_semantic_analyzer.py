@@ -17,7 +17,8 @@ class AtsSemanticAnalyzer:
         sanitized_text: str,
         jd: Optional[str] = None,
         target_role: Optional[str] = None,
-        section_scores: Optional[Dict[str, Any]] = None
+        section_scores: Optional[Dict[str, Any]] = None,
+        parsed_structure: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Queries AI for semantic feedback. 
@@ -31,7 +32,8 @@ class AtsSemanticAnalyzer:
                 text=sanitized_text,
                 jd=jd,
                 target_role=target_role,
-                section_scores=section_scores
+                section_scores=section_scores,
+                parsed_structure=parsed_structure
             )
             fallback_data["semantic_error"] = f"AI semantic analysis {reason}. Displaying local deterministic keyword match and rule-based recommendations."
             return fallback_data
