@@ -115,13 +115,13 @@ class AtsSemanticAnalyzer:
 Evaluate candidate qualifications against the exact job description accurately, objectively, and strictly based on the evidence in the resume.
 
 EVALUATION RULES:
-1. Extract required and preferred qualifications directly from the supplied job description.
+1. When a job description is provided, extract required and preferred qualifications directly from it. When only a target role is provided, identify qualifications and skills relevant to that role. If neither is provided, identify key candidate technical competencies demonstrated in the resume.
 2. Identify concrete resume evidence matching each qualification.
 3. Distinguish explicitly listed skills from skills demonstrated through projects, experience, or measurable outcomes.
    For matched skills, cite brief evidence in parentheses, e.g. "Python (Experience: Built REST API)", "Docker (Project: Microservices deployment)".
-4. Identify missing requirements (missing_required) and missing preferred skills (missing_preferred).
+4. Identify missing requirements (missing_required) and missing preferred skills (missing_preferred) from the job description.
 5. Highlight relevant project and work experience alignment in candidate strengths.
-6. Generate specific, practical, actionable improvement recommendations tailored to this exact job.
+6. Generate specific, practical, actionable improvement recommendations tailored to this exact job or role.
 7. NEVER invent skills, qualifications, experience, certifications, or achievements.
 8. NEVER assume a missing qualification is present if not stated in the resume.
 9. Personal identifying information (name, address, email, phone) has been redacted for privacy. NEVER penalize the candidate or treat absent personal info as an ATS deficiency.
@@ -142,7 +142,7 @@ STRICT SCHEMA LIMITS:
 - missing_preferred: maximum 5 nice-to-have or preferred skills from the job description not found in resume
 - strengths: maximum 3 items (maximum 120 characters each, highlighting demonstrated qualifications)
 - recommendations: maximum 4 items (maximum 140 characters each, specific actionable improvements for this job)
-- If no job description is provided, missing_keywords, missing_required, and missing_preferred must be [].
+- If no job description is provided, extract matched key competencies demonstrated in the resume for matched_keywords, while missing_keywords, missing_required, and missing_preferred must be [].
 - Output pure JSON without markdown fences, explanation, or commentary."""
 
         # Input preservation with generous safety boundaries
@@ -242,6 +242,31 @@ STRICT SCHEMA LIMITS:
             # If matched items contain evidence in parentheses, provide both clean skill and evidence
             clean_matched = [re.sub(r'\s*\(.*?\)', '', str(m)).strip() for m in matched if m]
             matched_evidence = [str(m) for m in matched if m]
+
+            # If AI returned empty matched keywords, populate from candidate's verified skills
+            if not clean_matched:
+                scorer = AtsScorer()
+                detected_skills = []
+                text_low = sanitized_text.lower()
+                for sk_key, sk_disp in scorer.SKILL_MAP.items():
+                    if re.search(scorer._skill_regex(sk_key), text_low) and sk_disp not in detected_skills:
+                        detected_skills.append(sk_disp)
+                if detected_skills:
+                    clean_matched = detected_skills[:8]
+                    matched_evidence = [
+                        f"{s} ({scorer.extract_skill_evidence(parsed_structure, sanitized_text, s.lower(), s) or 'Resume'})"
+                        for s in clean_matched
+                    ]
+
+            # If JD was supplied but missing_keywords is empty, check for missing JD requirements
+            if jd and jd.strip() and not missing:
+                scorer = AtsScorer()
+                jd_reqs = scorer.extract_jd_requirements(jd)
+                det_set = set(clean_matched)
+                missing_req = [s for s in jd_reqs.get("required_skills", []) if s not in det_set][:5]
+                missing_pref = [s for s in jd_reqs.get("preferred_skills", []) if s not in det_set][:5]
+                if missing_req or missing_pref:
+                    missing = [f"[Required] {s}" for s in missing_req] + [f"[Preferred] {s}" for s in missing_pref]
 
             return {
                 "semantic_analysis_available": True,

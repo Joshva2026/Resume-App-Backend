@@ -268,6 +268,13 @@ async def analyze_resume(
         "missing_preferred": semantic_result.get("missing_preferred", [])
     }
 
+    ai_prov = "Groq" if isinstance(provider, GroqAIProvider) else ("xAI" if isinstance(provider, XAIGrokAIProvider) else "NVIDIA")
+    if semantic_result.get("analysis_mode") == "ai":
+        ai_mod = getattr(settings, "ATS_GROQ_MODEL", "openai/gpt-oss-120b") if isinstance(provider, GroqAIProvider) else getattr(settings, "ATS_GROK_MODEL", "grok-2-latest")
+    else:
+        ai_prov = "Rule-based Engine"
+        ai_mod = "ats_v2.0"
+
     report = AtsReport(
         ats_document_id=analyze_req.document_id,
         target_role=analyze_req.target_role,
@@ -278,7 +285,9 @@ async def analyze_resume(
         strengths=semantic_result.get("strengths", []),
         semantic_analysis_available=semantic_result.get("semantic_analysis_available", True),
         semantic_error=semantic_result.get("semantic_error"),
-        analysis_mode=semantic_result.get("analysis_mode", "ai")
+        analysis_mode=semantic_result.get("analysis_mode", "ai"),
+        ai_provider=ai_prov,
+        ai_model=ai_mod
     )
 
     # 5. Store in isolated cache

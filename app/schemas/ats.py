@@ -23,3 +23,5 @@ class AtsReport(BaseModel):
     semantic_analysis_available: bool = True
     semantic_error: Optional[str] = None
     analysis_mode: Optional[str] = "ai"
+    ai_provider: Optional[str] = None
+    ai_model: Optional[str] = None
