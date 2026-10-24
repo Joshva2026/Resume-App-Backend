@@ -61,7 +61,9 @@ def test_analyze_with_jd():
             "matched_keywords": ["python"],
             "missing_keywords": ["java"],
             "recommendations": ["add java"],
-            "strengths": ["python is good"]
+            "strengths": ["python is good"],
+            "analysis_mode": "ai",
+            "semantic_analysis_available": True
         }
 
         # CASE B: With Target Role and JD
@@ -77,6 +79,8 @@ def test_analyze_with_jd():
         assert report["target_role"] == "Software Engineer"
         assert isinstance(report["section_scores"]["JD Match"], int)
         assert isinstance(report["section_scores"]["Target Role"], int)
+        assert report["ai_provider"] in ["Groq", "xAI"]
+        assert report["ai_model"] in ["openai/gpt-oss-120b", "grok-2-latest"]
 
 def test_analyze_provider_timeout_fallback():
     mock_db = MagicMock()
@@ -292,5 +296,95 @@ def test_ats_history_multiple_records():
     assert len(data) == 2
     assert data[0]["overall_score"] == 88
     assert data[1]["overall_score"] == 62
+
+def test_ats_analyze_ai_mode_provider_metadata_no_nameerror():
+    """
+    Regression test for BUG 1: Ensures that when AI semantic analysis succeeds
+    (analysis_mode='ai'), the router accesses settings without raising NameError
+    and returns correct provider and model metadata.
+    """
+    from app.services.groq_provider import GroqAIProvider
+    from app.core.config import settings
+
+    mock_db = MagicMock()
+    mock_db.table().select().eq().eq().execute.return_value = MagicMock(
+        data=[{"parsed_structure": {
+            "experience": "Senior Backend Developer with 5 years of Python experience.",
+            "skills": "Python, FastAPI, Docker, PostgreSQL",
+            "education": "B.S. Computer Science"
+        }}]
+    )
+    mock_db.table().insert().execute.return_value = None
+
+    def mock_get_db():
+        return mock_db
+
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    app.dependency_overrides[get_supabase_client] = mock_get_db
+
+    with patch.object(settings, "GROQ_API_KEY", "gsk_test_mock_key"), \
+         patch.object(settings, "ATS_GROQ_MODEL", "openai/gpt-oss-120b"), \
+         patch.object(AtsSemanticAnalyzer, 'analyze', new_callable=AsyncMock) as mock_analyze:
+
+        mock_analyze.return_value = {
+            "matched_keywords": ["Python", "FastAPI"],
+            "missing_keywords": ["Redis"],
+            "missing_required": ["Redis"],
+            "missing_preferred": [],
+            "recommendations": ["Add Redis caching project"],
+            "strengths": ["Strong Python experience"],
+            "analysis_mode": "ai",
+            "semantic_analysis_available": True
+        }
+
+        response = client.post("/ats/analyze", json={
+            "document_id": "doc_regression_nameerror",
+            "target_role": "Backend Engineer",
+            "job_description": "Looking for Backend Engineer skilled in Python and Redis"
+        })
+
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+        report = response.json()
+        assert report["ai_provider"] == "Groq"
+        assert report["ai_model"] == "openai/gpt-oss-120b"
+        assert report["analysis_mode"] == "ai"
+        assert report["semantic_analysis_available"] is True
+
+def test_groq_nvidia_provider_isolation():
+    """
+    Verifies that ATS AI analysis uses Groq with openai/gpt-oss-120b,
+    while AI Assistant uses NVIDIA with openai/gpt-oss-20b.
+    """
+    from app.services.groq_provider import GroqAIProvider
+    from app.services.nvidia_provider import NvidiaAIProvider
+    from app.services.ats_semantic_analyzer import get_default_ats_provider
+    from app.core.config import settings
+
+    with patch.object(settings, "GROQ_API_KEY", "gsk_isolation_test_key"):
+        ats_provider = get_default_ats_provider()
+        assert isinstance(ats_provider, GroqAIProvider)
+        assert ats_provider.model == "openai/gpt-oss-120b"
+
+    chat_provider = NvidiaAIProvider()
+    assert chat_provider.model == "openai/gpt-oss-20b"
+    assert settings.NVIDIA_MODEL == "openai/gpt-oss-20b"
+
+def test_different_job_descriptions_produce_distinct_cache_keys():
+    """
+    Verifies that different job descriptions for the same resume produce
+    distinct cache keys so analysis results are never improperly shared.
+    """
+    from app.services.ats_cache import AtsAnalysisCache
+
+    user_id = "test_user_unique_cache"
+    resume = "Experienced software engineer with Python"
+    role = "Software Engineer"
+    jd1 = "Looking for a Python and Docker developer"
+    jd2 = "Looking for a React and TypeScript frontend developer"
+
+    key1 = AtsAnalysisCache.make_key(user_id, resume, jd1, role, "ats_v2.0")
+    key2 = AtsAnalysisCache.make_key(user_id, resume, jd2, role, "ats_v2.0")
+
+    assert key1 != key2, "Different job descriptions must generate distinct cache keys"
 
 

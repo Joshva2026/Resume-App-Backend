@@ -3,7 +3,7 @@ import logging
 import re
 from typing import Dict, Any, List, Optional
 from app.core.config import settings
-from app.services.ai_provider import AIProvider, ProviderTimeoutError, ProviderUnavailableError
+from app.services.ai_provider import AIProvider, ProviderTimeoutError, ProviderUnavailableError, MalformedResponseError
 from app.services.grok_provider import XAIGrokAIProvider, GrokAIProvider
 from app.services.groq_provider import GroqAIProvider
 from app.schemas.ai import AIRequest
@@ -111,21 +111,22 @@ class AtsSemanticAnalyzer:
             fallback_data["semantic_error"] = f"AI semantic analysis {reason}. Displaying local deterministic keyword match and rule-based recommendations."
             return fallback_data
 
-        system_prompt = """You are an ATS Semantic Analyzer and expert technical recruiter.
-Evaluate candidate qualifications against the exact job description accurately, objectively, and strictly based on the evidence in the resume.
+        system_prompt = """You are an expert ATS Semantic Analyzer and technical recruiter.
+Evaluate candidate qualifications against the job description accurately, objectively, and strictly based on resume evidence.
 
 EVALUATION RULES:
-1. When a job description is provided, extract required and preferred qualifications directly from it. When only a target role is provided, identify qualifications and skills relevant to that role. If neither is provided, identify key candidate technical competencies demonstrated in the resume.
-2. Identify concrete resume evidence matching each qualification.
-3. Distinguish explicitly listed skills from skills demonstrated through projects, experience, or measurable outcomes.
-   For matched skills, cite brief evidence in parentheses, e.g. "Python (Experience: Built REST API)", "Docker (Project: Microservices deployment)".
-4. Identify missing requirements (missing_required) and missing preferred skills (missing_preferred) from the job description.
-5. Highlight relevant project and work experience alignment in candidate strengths.
-6. Generate specific, practical, actionable improvement recommendations tailored to this exact job or role.
-7. NEVER invent skills, qualifications, experience, certifications, or achievements.
+1. When a job description is provided, extract required qualifications (missing_required) and preferred qualifications (missing_preferred) directly from it. When only a target role is provided, identify qualifications relevant to that role. If neither is provided, identify key candidate technical competencies demonstrated in the resume.
+2. For matched skills, cite concise resume evidence in parentheses, e.g. "Python (Experience: Built REST API)", "Docker (Project: Microservices deployment)".
+3. Identify missing required skills (missing_required) and missing preferred skills (missing_preferred) from the job description.
+4. Populate missing_keywords with missing required and preferred skills combined.
+5. Highlight 2-3 genuine candidate strengths grounded in demonstrated experience or achievements.
+6. Provide 3-4 specific, actionable improvement recommendations tailored to this exact job or role.
+7. EVIDENCE GROUNDING: NEVER invent or hallucinate skills, qualifications, experience, certifications, or metrics not found in the resume.
 8. NEVER assume a missing qualification is present if not stated in the resume.
 9. Personal identifying information (name, address, email, phone) has been redacted for privacy. NEVER penalize the candidate or treat absent personal info as an ATS deficiency.
-10. Return ONLY a valid JSON object matching this schema without markdown fences, explanation, or commentary:
+10. DIRECTNESS: Be direct, concise, and factual. Minimize internal reasoning. Output pure JSON without markdown fences, explanation, or commentary.
+
+SCHEMA FORMAT:
 {
   "matched_keywords": [],
   "missing_keywords": [],
@@ -135,15 +136,14 @@ EVALUATION RULES:
   "recommendations": []
 }
 
-STRICT SCHEMA LIMITS:
+STRICT LIMITS:
 - matched_keywords: maximum 8 items with brief evidence citation
-- missing_keywords: maximum 8 items (required or preferred skills from the job description not found in resume)
-- missing_required: maximum 5 mandatory skills from the job description not found in resume
-- missing_preferred: maximum 5 nice-to-have or preferred skills from the job description not found in resume
-- strengths: maximum 3 items (maximum 120 characters each, highlighting demonstrated qualifications)
-- recommendations: maximum 4 items (maximum 140 characters each, specific actionable improvements for this job)
-- If no job description is provided, extract matched key competencies demonstrated in the resume for matched_keywords, while missing_keywords, missing_required, and missing_preferred must be [].
-- Output pure JSON without markdown fences, explanation, or commentary."""
+- missing_keywords: maximum 8 items
+- missing_required: maximum 5 mandatory skills from JD not found in resume
+- missing_preferred: maximum 5 nice-to-have skills from JD not found in resume
+- strengths: maximum 3 concise items (under 110 characters each)
+- recommendations: maximum 4 concise items (under 130 characters each)
+- If no job description is provided, extract matched competencies for matched_keywords, and set missing_keywords, missing_required, missing_preferred to []."""
 
         # Input preservation with generous safety boundaries
         compact_text = self._compact_resume_text(sanitized_text, max_chars=8000)
@@ -175,9 +175,10 @@ STRICT SCHEMA LIMITS:
             system_prompt=system_prompt,
             user_prompt=safe_user_prompt,
             temperature=0.1,
-            max_tokens=1600,
+            max_tokens=2500,
             model_id=selected_model,
-            timeout=timeout_val
+            timeout=timeout_val,
+            response_format={"type": "json_object"}
         )
 
         try:
@@ -212,6 +213,10 @@ STRICT SCHEMA LIMITS:
             except json.JSONDecodeError:
                 logger.error(f"ATS AI JSONDecodeError. Content snippet: {content[:200]}")
                 return get_fallback("returned malformed JSON")
+
+            if not isinstance(parsed, dict) or not any(k in parsed for k in ["matched_keywords", "missing_keywords", "strengths", "recommendations"]):
+                logger.error("ATS AI returned invalid schema structure.")
+                return get_fallback("returned an invalid JSON structure")
 
             # If no JD and no target role, force missing keywords to empty
             if (not jd or not jd.strip()) and (not target_role or not target_role.strip()):
@@ -283,6 +288,11 @@ STRICT SCHEMA LIMITS:
         except (ProviderTimeoutError, ProviderUnavailableError) as e:
             logger.error(f"ATS AI Provider Error: {str(e)}")
             return get_fallback("timed out or was temporarily unavailable")
+        except MalformedResponseError as e:
+            logger.warning(f"ATS AI Provider Malformed/Truncated Error: {str(e)}")
+            if "truncated" in str(e).lower() or "length" in str(e).lower():
+                return get_fallback("was truncated by provider")
+            return get_fallback("returned an invalid response format")
         except Exception as e:
             logger.error(f"ATS AI Parsing/Unknown Error: {str(e)}")
             return get_fallback("encountered an unexpected error")

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 class NvidiaAIProvider(AIProvider):
     _shared_client = None
+    _shared_loop = None
 
     @classmethod
     def get_effective_timeouts(cls) -> tuple[float, float, Optional[float], Optional[float]]:
@@ -31,10 +32,10 @@ class NvidiaAIProvider(AIProvider):
         # Keep read timeout bounded for non-streaming
         read_timeout = max(5.0, min(configured_read, 80.0))
         
-        # Stream read timeout is None by default (disabled) to allow long generations to finish
-        stream_read_timeout = None
+        # Stream read timeout: default 100.0s, bounded max 105.0s (strictly below Android's 120s limit)
+        stream_read_timeout = 100.0
         if configured_stream_read is not None:
-            stream_read_timeout = max(10.0, min(float(configured_stream_read), 90.0))
+            stream_read_timeout = max(10.0, min(float(configured_stream_read), 105.0))
             
         inter_chunk_timeout = None
         if configured_inter_chunk is not None:
@@ -44,8 +45,18 @@ class NvidiaAIProvider(AIProvider):
 
     @classmethod
     def get_client(cls) -> httpx.AsyncClient:
+        current_loop = None
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
         connect_timeout, read_timeout, _, _ = cls.get_effective_timeouts()
-        if cls._shared_client is None or cls._shared_client.is_closed:
+        if (
+            cls._shared_client is None 
+            or cls._shared_client.is_closed 
+            or (cls._shared_loop is not None and cls._shared_loop != current_loop)
+        ):
             timeout_config = httpx.Timeout(
                 timeout=read_timeout,
                 connect=connect_timeout,
@@ -55,6 +66,7 @@ class NvidiaAIProvider(AIProvider):
             )
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0)
             cls._shared_client = httpx.AsyncClient(timeout=timeout_config, limits=limits)
+            cls._shared_loop = current_loop
         return cls._shared_client
 
     @classmethod
@@ -62,6 +74,7 @@ class NvidiaAIProvider(AIProvider):
         if cls._shared_client is not None and not cls._shared_client.is_closed:
             await cls._shared_client.aclose()
             cls._shared_client = None
+            cls._shared_loop = None
 
     def __init__(self):
         self.api_key = settings.NVIDIA_API_KEY
@@ -318,8 +331,8 @@ class NvidiaAIProvider(AIProvider):
                                 if choice.get("finish_reason"):
                                     finish_reason = choice.get("finish_reason")
                                 delta = choice.get("delta", {})
-                                content = delta.get("content") or ""
-                                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                                content = delta.get("content") or delta.get("text") or choice.get("text") or ""
+                                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or choice.get("reasoning_content") or ""
                                 
                                 now = time.time()
                                 gap = now - last_chunk_time
@@ -344,15 +357,18 @@ class NvidiaAIProvider(AIProvider):
                         except Exception:
                             continue
 
-                # If no content tokens were emitted but model completed reasoning, yield reasoning as fallback
-                if content_chunks_count == 0 and accumulated_reasoning:
-                    fallback_text = "".join(accumulated_reasoning).strip()
-                    if fallback_text:
+                # Requirement 4: Distinguish reasoning metadata from user-facing answer content.
+                # If no user content chunks were emitted, NEVER yield internal reasoning as answer fallback.
+                if content_chunks_count == 0:
+                    if accumulated_reasoning:
                         logger.warning(
-                            f"Model {actual_model} emitted only reasoning tokens ({len(fallback_text)} chars); "
-                            "yielding reasoning as response content fallback."
+                            f"Model {actual_model} emitted only reasoning metadata ({reasoning_chunks_count} chunks) "
+                            "without any user-facing answer content."
                         )
-                        yield fallback_text
+                        raise MalformedResponseError("Model emitted reasoning metadata without final answer content")
+                    else:
+                        logger.warning(f"Model {actual_model} completed stream with 0 content chunks.")
+                        raise MalformedResponseError("AI provider completed without emitting answer content")
 
                 total_duration_ms = int((time.time() - t_start) * 1000)
                 ttft_ms = int(first_token_time * 1000) if first_token_time else None

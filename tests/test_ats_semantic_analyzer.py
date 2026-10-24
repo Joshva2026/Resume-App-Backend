@@ -3,7 +3,7 @@ import json
 import asyncio
 from app.services.ats_semantic_analyzer import AtsSemanticAnalyzer
 from app.schemas.ai import AIResponse, AIRequest
-from app.services.ai_provider import AIProvider, ProviderTimeoutError
+from app.services.ai_provider import AIProvider, ProviderTimeoutError, MalformedResponseError
 
 class MockProvider(AIProvider):
     def __init__(self, content: str, finish_reason: str = None, raise_exception=None):
@@ -144,3 +144,46 @@ async def test_provider_timeout():
     assert "Docker" in result["missing_keywords"]
     assert len(result["recommendations"]) > 0
     assert len(result["strengths"]) > 0
+
+@pytest.mark.asyncio
+async def test_malformed_response_truncation_triggers_fallback():
+    # Verify that Groq truncation raising MalformedResponseError triggers honest deterministic fallback
+    provider = MockProvider(content="", raise_exception=MalformedResponseError("Groq response truncated due to length/max_tokens"))
+    analyzer = AtsSemanticAnalyzer(provider)
+    result = await analyzer.analyze("Proficient with Python and PostgreSQL.", "Requires Python and Docker.")
+
+    assert result["semantic_analysis_available"] is False
+    assert result["analysis_mode"] == "deterministic_fallback"
+    assert "was truncated by provider" in result["semantic_error"]
+    assert "Python" in result["matched_keywords"]
+    assert "Docker" in result["missing_keywords"]
+
+@pytest.mark.asyncio
+async def test_analyzer_sends_structured_json_request():
+    # Verify analyzer sets structured json response_format and adequate max_tokens
+    mock_json = {
+        "matched_keywords": ["Python"],
+        "missing_keywords": [],
+        "missing_required": [],
+        "missing_preferred": [],
+        "strengths": ["Strong background"],
+        "recommendations": ["Add metrics"]
+    }
+    provider = MockProvider(content=json.dumps(mock_json))
+    analyzer = AtsSemanticAnalyzer(provider)
+    await analyzer.analyze("Experienced engineer with Python", "Looking for Python dev")
+
+    assert provider.last_request is not None
+    assert provider.last_request.response_format == {"type": "json_object"}
+    assert provider.last_request.max_tokens >= 2000
+
+@pytest.mark.asyncio
+async def test_non_dict_json_triggers_fallback():
+    # Verify non-dict JSON structure safely activates fallback
+    provider = MockProvider(content='[{"item": 1}]')
+    analyzer = AtsSemanticAnalyzer(provider)
+    result = await analyzer.analyze("resume text with Python", "job with Python")
+
+    assert result["semantic_analysis_available"] is False
+    assert result["analysis_mode"] == "deterministic_fallback"
+    assert "invalid JSON structure" in result["semantic_error"]

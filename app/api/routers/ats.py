@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any
 import logging
 import uuid
 
+from app.core.config import settings
 from app.schemas.ats import AtsParseResponse, AtsAnalyzeRequest, AtsReport
 from app.services.ats_parser import AtsParser
 from app.services.ats_scorer import AtsScorer

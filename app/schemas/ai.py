@@ -9,6 +9,7 @@ class AIRequest(BaseModel):
     max_tokens: int = Field(default=4096, ge=1, le=4096)
     model_id: Optional[str] = None
     timeout: Optional[float] = None
+    response_format: Optional[Dict[str, Any]] = None
     
     model_config = {"protected_namespaces": ()}
 

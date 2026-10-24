@@ -213,3 +213,38 @@ async def test_groq_truncated_response_raises_malformed(groq_provider):
         with pytest.raises(MalformedResponseError) as exc_info:
             await groq_provider.generate(req)
         assert "truncated" in str(exc_info.value).lower()
+
+@pytest.mark.asyncio
+async def test_groq_response_format_payload(groq_provider):
+    mock_payload = {
+        "id": "chatcmpl-json",
+        "object": "chat.completion",
+        "model": "openai/gpt-oss-120b",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "{\"status\": \"ok\"}"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+    }
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = mock_payload
+    mock_resp.text = json.dumps(mock_payload)
+
+    with patch.object(groq_provider, 'get_client') as mock_get_client:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        mock_get_client.return_value = mock_client
+
+        req = AIRequest(
+            system_prompt="Return json output",
+            user_prompt="list skills",
+            response_format={"type": "json_object"}
+        )
+        resp = await groq_provider.generate(req)
+        assert resp.content == '{"status": "ok"}'
+
+        call_args = mock_client.post.call_args
+        sent_json = call_args[1]["json"]
+        assert sent_json.get("response_format") == {"type": "json_object"}

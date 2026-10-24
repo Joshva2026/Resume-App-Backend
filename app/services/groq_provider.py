@@ -95,12 +95,18 @@ class GroqAIProvider(AIProvider):
 
         actual_model = (request.model_id or self.model or getattr(settings, "ATS_GROQ_MODEL", "openai/gpt-oss-120b")).strip()
 
+        # Allow max_tokens up to request.max_tokens, comfortably supporting reasoning + JSON while bounded safely
+        max_tok = max(1, min(request.max_tokens, 4096))
         payload = {
             "model": actual_model,
             "messages": messages,
             "temperature": request.temperature,
-            "max_tokens": min(request.max_tokens, 2048)
+            "max_tokens": max_tok
         }
+        if request.response_format:
+            payload["response_format"] = request.response_format
+        elif "json" in (request.system_prompt or "").lower() or "json" in (request.user_prompt or "").lower():
+            payload["response_format"] = {"type": "json_object"}
 
         # Bounded timeouts
         configured_timeout = request.timeout or float(getattr(settings, "ATS_AI_TIMEOUT_SECONDS", 35.0))

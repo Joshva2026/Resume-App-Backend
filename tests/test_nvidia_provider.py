@@ -7,7 +7,8 @@ from app.services.ai_provider import (
     ProviderTimeoutError,
     ProviderUnavailableError,
     RateLimitError,
-    ProviderAuthenticationError
+    ProviderAuthenticationError,
+    MalformedResponseError
 )
 import asyncio
 
@@ -209,19 +210,24 @@ async def test_effective_timeout_bounds():
         # Default / within bounds
         mock_settings.AI_CONNECT_TIMEOUT_SECONDS = 10
         mock_settings.AI_REQUEST_TIMEOUT_SECONDS = 70
-        mock_settings.AI_STREAM_READ_TIMEOUT_SECONDS = 85
+        mock_settings.AI_STREAM_READ_TIMEOUT_SECONDS = 100
         mock_settings.AI_INTER_CHUNK_TIMEOUT_SECONDS = 25
         conn, read, stream_read, inter_chunk = NvidiaAIProvider.get_effective_timeouts()
         assert conn == 10.0
         assert read == 70.0
-        assert stream_read == 85.0
+        assert stream_read == 100.0
         assert inter_chunk == 25.0
         
-        # Upper bound enforcement (< 90.0s for stream read to stay below Render's 100s deadline)
+        # When AI_STREAM_READ_TIMEOUT_SECONDS is None, default to 100.0s
+        mock_settings.AI_STREAM_READ_TIMEOUT_SECONDS = None
+        conn, read, stream_read, inter_chunk = NvidiaAIProvider.get_effective_timeouts()
+        assert stream_read == 100.0
+
+        # Upper bound enforcement (capped at 105.0s to strictly stay below Android's 120s deadline)
         mock_settings.AI_STREAM_READ_TIMEOUT_SECONDS = 150
         mock_settings.AI_INTER_CHUNK_TIMEOUT_SECONDS = 60
         conn, read, stream_read, inter_chunk = NvidiaAIProvider.get_effective_timeouts()
-        assert stream_read == 90.0
+        assert stream_read == 105.0
         assert inter_chunk == 45.0
         
         # Lower bound enforcement
@@ -301,6 +307,50 @@ async def test_nvidia_generate_stream_reasoning_tokens_and_content(provider):
             tokens.append(chunk)
         # Verify reasoning is filtered out from user content stream
         assert tokens == ["Add Kotlin to your skills section."]
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_reasoning_only_raises_malformed(provider):
+    class MockStreamReasoningOnlyResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            # Model emits ONLY reasoning tokens and no content tokens
+            yield 'data: {"choices":[{"delta":{"reasoning_content":"Internal monologue step 1"}}]}'
+            yield 'data: {"choices":[{"delta":{"reasoning_content":" Internal monologue step 2"}}]}'
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockStreamReasoningOnlyResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Analyze resume")
+        # Must raise MalformedResponseError rather than yielding internal reasoning to user
+        with pytest.raises(MalformedResponseError) as exc_info:
+            async for _ in provider.generate_stream(req):
+                pass
+        assert "reasoning metadata without final answer" in str(exc_info.value)
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_empty_stream_raises_malformed(provider):
+    class MockStreamEmptyResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            yield ': ping'
+            yield 'data: {"id":"1","choices":[]}'  # empty choices chunk
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockStreamEmptyResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Empty stream")
+        with pytest.raises(MalformedResponseError) as exc_info:
+            async for _ in provider.generate_stream(req):
+                pass
+        assert "without emitting answer content" in str(exc_info.value)
 
 @pytest.mark.asyncio
 async def test_nvidia_generate_stream_error_chunk_raises_exception(provider):
@@ -441,6 +491,23 @@ async def test_nvidia_generate_stream_long_complete_response(provider):
         assert len(tokens) == 30
         assert tokens[0] == "word0 "
         assert tokens[29] == "word29 "
+
+@pytest.mark.asyncio
+async def test_nvidia_client_event_loop_safety():
+    # Close any existing client
+    await NvidiaAIProvider.close_client()
+    client1 = NvidiaAIProvider.get_client()
+    assert client1 is not None
+    assert not client1.is_closed
+    
+    # Simulate a loop change by artificially setting _shared_loop to None / fake loop
+    fake_loop = object()
+    NvidiaAIProvider._shared_loop = fake_loop
+    client2 = NvidiaAIProvider.get_client()
+    assert client2 is not None
+    # Verify client was refreshed
+    assert client2 is not client1
+    await NvidiaAIProvider.close_client()
 
 
 

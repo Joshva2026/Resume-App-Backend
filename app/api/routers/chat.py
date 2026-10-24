@@ -464,7 +464,7 @@ async def chat_stream(
             if not has_yielded:
                 _rollback_failed_turn()
             logger.error(f"AI Provider streaming malformed response: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'Bad response from AI service'})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'The AI response was incomplete. Please try again.'})}\n\n"
         except Exception as e:
             if not has_yielded:
                 _rollback_failed_turn()

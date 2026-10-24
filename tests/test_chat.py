@@ -458,5 +458,32 @@ def test_chat_stream_heartbeats_without_visible_text_contamination():
         # Ensure no ": keepalive" or comments leaked into content
         assert all(": keepalive" not in t for t in content_tokens)
 
+def test_chat_stream_malformed_response_emits_error_and_rolls_back():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-malformed-stream", msg_id="msg-malformed-stream")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_malformed(req):
+        raise MalformedResponseError("Model emitted reasoning metadata without final answer content")
+        yield
+    mock_provider.generate_stream = mock_stream_malformed
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Analyze my resume"})
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    lines = [line for line in response.text.split("\n") if line.startswith("data: ")]
+    assert len(lines) == 1
+    
+    import json
+    err = json.loads(lines[0][6:])
+    assert err["type"] == "error"
+    assert "incomplete" in err["detail"].lower()
+    
+    # Verify rollback happened: unresponded user turn was deleted
+    mock_sb.table("ai_messages").delete.assert_called()
+    mock_sb.table("ai_conversations").delete.assert_called()
+
 
 
