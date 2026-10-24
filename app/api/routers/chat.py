@@ -388,6 +388,11 @@ async def chat_stream(
                     _rollback_failed_turn()
                 yield f"data: {json.dumps({'type': 'error', 'detail': 'Empty response received from AI service'})}\n\n"
 
+        except ProviderAuthenticationError as e:
+            if not has_yielded:
+                _rollback_failed_turn()
+            logger.error(f"AI Provider streaming authentication failure: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'AI Provider configuration error'})}\n\n"
         except ProviderTimeoutError as e:
             if not has_yielded:
                 _rollback_failed_turn()
@@ -403,6 +408,16 @@ async def chat_stream(
                 _rollback_failed_turn()
             logger.warning(f"AI Provider streaming unavailable: {e}")
             yield f"data: {json.dumps({'type': 'error', 'detail': 'AI service temporarily unavailable'})}\n\n"
+        except InvalidRequestError as e:
+            if not has_yielded:
+                _rollback_failed_turn()
+            logger.error(f"AI Provider streaming invalid request: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'Invalid request to AI service'})}\n\n"
+        except MalformedResponseError as e:
+            if not has_yielded:
+                _rollback_failed_turn()
+            logger.error(f"AI Provider streaming malformed response: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'Bad response from AI service'})}\n\n"
         except Exception as e:
             if not has_yielded:
                 _rollback_failed_turn()

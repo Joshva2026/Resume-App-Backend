@@ -296,3 +296,85 @@ def test_chat_stream_timeout_emits_error_and_rolls_back():
     mock_sb.table("ai_messages").delete.assert_called()
     mock_sb.table("ai_conversations").delete.assert_called()
 
+def test_chat_stream_auth_error_emits_error_event():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-stream-auth", msg_id="msg-stream-auth")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_auth_fail(req):
+        raise ProviderAuthenticationError("Invalid API key configured")
+        yield
+    mock_provider.generate_stream = mock_stream_auth_fail
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Auth fail stream"})
+    assert response.status_code == 200
+    lines = [line for line in response.text.split("\n") if line.startswith("data: ")]
+    assert len(lines) == 1
+    import json
+    err = json.loads(lines[0][6:])
+    assert err["type"] == "error"
+    assert "configuration error" in err["detail"].lower()
+
+def test_chat_stream_rate_limit_error_emits_error_event():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-stream-rate", msg_id="msg-stream-rate")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_rate_limit(req):
+        raise RateLimitError("Rate limit exceeded")
+        yield
+    mock_provider.generate_stream = mock_stream_rate_limit
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Rate limit stream"})
+    assert response.status_code == 200
+    lines = [line for line in response.text.split("\n") if line.startswith("data: ")]
+    assert len(lines) == 1
+    import json
+    err = json.loads(lines[0][6:])
+    assert err["type"] == "error"
+    assert "rate limit" in err["detail"].lower()
+
+def test_chat_stream_provider_unavailable_error_emits_error_event():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-stream-unavail", msg_id="msg-stream-unavail")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_unavail(req):
+        raise ProviderUnavailableError("NVIDIA service unavailable")
+        yield
+    mock_provider.generate_stream = mock_stream_unavail
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Unavailable stream"})
+    assert response.status_code == 200
+    lines = [line for line in response.text.split("\n") if line.startswith("data: ")]
+    assert len(lines) == 1
+    import json
+    err = json.loads(lines[0][6:])
+    assert err["type"] == "error"
+    assert "unavailable" in err["detail"].lower()
+
+def test_chat_existing_conversation_not_deleted_on_failure():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    # is_new = False simulates an existing conversation with history
+    mock_sb = build_mock_supabase(is_new=False, conv_id="conv-existing", msg_id="msg-new-user")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    mock_provider.generate = AsyncMock(side_effect=ProviderTimeoutError("AI request timed out"))
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat", json={"conversation_id": "conv-existing", "message": "Add to existing"})
+    assert response.status_code == 504
+
+    # Verify that the unresponded user message was deleted
+    mock_sb.table("ai_messages").delete.assert_called()
+    # But ai_conversations MUST NOT be deleted because it is an existing conversation
+    mock_sb.table("ai_conversations").delete.assert_not_called()
+
+
