@@ -209,19 +209,29 @@ async def test_effective_timeout_bounds():
         # Default / within bounds
         mock_settings.AI_CONNECT_TIMEOUT_SECONDS = 10
         mock_settings.AI_REQUEST_TIMEOUT_SECONDS = 70
-        conn, read = NvidiaAIProvider.get_effective_timeouts()
+        mock_settings.AI_STREAM_READ_TIMEOUT_SECONDS = 85
+        mock_settings.AI_INTER_CHUNK_TIMEOUT_SECONDS = 25
+        conn, read, stream_read, inter_chunk = NvidiaAIProvider.get_effective_timeouts()
         assert conn == 10.0
         assert read == 70.0
+        assert stream_read == 85.0
+        assert inter_chunk == 25.0
         
-        # Upper bound enforcement (< 80.0s for Render's 100s deadline)
-        mock_settings.AI_REQUEST_TIMEOUT_SECONDS = 150
-        conn, read = NvidiaAIProvider.get_effective_timeouts()
-        assert read == 80.0
+        # Upper bound enforcement (< 90.0s for stream read to stay below Render's 100s deadline)
+        mock_settings.AI_STREAM_READ_TIMEOUT_SECONDS = 150
+        mock_settings.AI_INTER_CHUNK_TIMEOUT_SECONDS = 60
+        conn, read, stream_read, inter_chunk = NvidiaAIProvider.get_effective_timeouts()
+        assert stream_read == 90.0
+        assert inter_chunk == 45.0
         
         # Lower bound enforcement
         mock_settings.AI_REQUEST_TIMEOUT_SECONDS = 2
-        conn, read = NvidiaAIProvider.get_effective_timeouts()
+        mock_settings.AI_STREAM_READ_TIMEOUT_SECONDS = 2
+        mock_settings.AI_INTER_CHUNK_TIMEOUT_SECONDS = 1
+        conn, read, stream_read, inter_chunk = NvidiaAIProvider.get_effective_timeouts()
         assert read == 5.0
+        assert stream_read == 10.0
+        assert inter_chunk == 5.0
 
 @pytest.mark.asyncio
 async def test_nvidia_generate_stream_success(provider):
@@ -232,9 +242,11 @@ async def test_nvidia_generate_stream_success(provider):
         async def __aexit__(self, exc_type, exc_val, exc_tb):
             pass
         async def aiter_lines(self):
+            yield ': ping'
             yield 'data: {"id":"1","choices":[{"delta":{"content":"Hello"}}]}'
             yield ''
             yield 'data: {"id":"2","choices":[{"delta":{"content":" World"}}]}'
+            yield 'data: {"id":"3","choices":[]}'  # usage or empty choices
             yield 'data: [DONE]'
 
     with patch("httpx.AsyncClient.stream") as mock_stream:
@@ -264,4 +276,49 @@ async def test_nvidia_generate_stream_read_timeout(provider):
             async for _ in provider.generate_stream(req):
                 pass
         assert "The AI response took too long" in str(exc_info.value)
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_reasoning_tokens_and_content(provider):
+    class MockStreamReasoningResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            # Model emits reasoning tokens first
+            yield 'data: {"choices":[{"delta":{"reasoning_content":"Thinking about user resume"}}]}'
+            yield 'data: {"choices":[{"delta":{"reasoning_content":" Still analyzing skills"}}]}'
+            # Then model emits final content
+            yield 'data: {"choices":[{"delta":{"content":"Add Kotlin to your skills section."}}]}'
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockStreamReasoningResponse()
+        req = AIRequest(system_prompt="System", user_prompt="How do I improve my resume?")
+        tokens = []
+        async for chunk in provider.generate_stream(req):
+            tokens.append(chunk)
+        # Verify reasoning is filtered out from user content stream
+        assert tokens == ["Add Kotlin to your skills section."]
+
+@pytest.mark.asyncio
+async def test_nvidia_generate_stream_error_chunk_raises_exception(provider):
+    class MockStreamErrorChunkResponse:
+        status_code = 200
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+        async def aiter_lines(self):
+            yield 'data: {"error":{"code":429,"message":"Rate limit exceeded for model"}}'
+            yield 'data: [DONE]'
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_stream.return_value = MockStreamErrorChunkResponse()
+        req = AIRequest(system_prompt="System", user_prompt="Hi")
+        with pytest.raises(RateLimitError):
+            async for _ in provider.generate_stream(req):
+                pass
+
 

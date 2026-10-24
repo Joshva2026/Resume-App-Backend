@@ -296,6 +296,53 @@ def test_chat_stream_timeout_emits_error_and_rolls_back():
     mock_sb.table("ai_messages").delete.assert_called()
     mock_sb.table("ai_conversations").delete.assert_called()
 
+def test_chat_stream_flushes_initial_ping():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-ping-1", msg_id="msg-ping-1")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_gen(req):
+        yield "Hi"
+    mock_provider.generate_stream = mock_stream_gen
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Ping test"})
+    assert response.status_code == 200
+    all_lines = response.text.split("\n")
+    # Verify first line is an SSE comment ping
+    assert all_lines[0] == ": ping"
+
+def test_chat_stream_partial_output_timeout_preserves_messages_no_rollback():
+    app.dependency_overrides[get_current_user_id] = mock_get_user
+    mock_sb = build_mock_supabase(is_new=True, conv_id="conv-stream-partial", msg_id="msg-stream-partial")
+    app.dependency_overrides[get_supabase_client] = lambda: mock_sb
+
+    mock_provider = MagicMock()
+    async def mock_stream_partial_timeout(req):
+        yield "Initial advice on resume: "
+        raise ProviderTimeoutError("Stalled stream after initial chunks")
+    mock_provider.generate_stream = mock_stream_partial_timeout
+    app.dependency_overrides[get_ai_provider] = lambda: mock_provider
+
+    response = client.post("/ai/chat/stream", json={"message": "Tell me about my resume"})
+    assert response.status_code == 200
+    lines = [line for line in response.text.split("\n") if line.startswith("data: ")]
+    assert len(lines) == 2  # 1 chunk + 1 error
+    
+    import json
+    chunk = json.loads(lines[0][6:])
+    assert chunk["type"] == "chunk"
+    assert chunk["content"] == "Initial advice on resume: "
+    
+    err = json.loads(lines[1][6:])
+    assert err["type"] == "error"
+    assert "The AI response took too long" in err["detail"]
+    
+    # Because tokens were yielded, the turn MUST NOT be rolled back
+    mock_sb.table("ai_messages").delete.assert_not_called()
+    mock_sb.table("ai_conversations").delete.assert_not_called()
+
 def test_chat_stream_auth_error_emits_error_event():
     app.dependency_overrides[get_current_user_id] = mock_get_user
     mock_sb = build_mock_supabase(is_new=True, conv_id="conv-stream-auth", msg_id="msg-stream-auth")

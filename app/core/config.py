@@ -15,7 +15,9 @@ class Settings(BaseSettings):
     AI_RATE_LIMIT_PER_MINUTE: int = 10
     AI_REQUEST_TIMEOUT_SECONDS: int = 70
     AI_CONNECT_TIMEOUT_SECONDS: int = 10
-    AI_MAX_TOKENS: int = 1024
+    AI_STREAM_READ_TIMEOUT_SECONDS: int = 85
+    AI_INTER_CHUNK_TIMEOUT_SECONDS: int = 25
+    AI_MAX_TOKENS: int = 2048
     
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

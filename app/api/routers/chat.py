@@ -347,11 +347,13 @@ async def chat_stream(
         user_prompt=chat_req.message,
         history=history_messages,
         temperature=0.7,
-        max_tokens=getattr(settings, "AI_MAX_TOKENS", 1024),
+        max_tokens=getattr(settings, "AI_MAX_TOKENS", 2048),
         model_id=model_id
     )
 
     async def event_generator():
+        # Immediately emit an initial SSE comment to flush HTTP 200 headers to client and proxy
+        yield ": ping\n\n"
         accumulated_chunks = []
         has_yielded = False
         try:
@@ -396,7 +398,20 @@ async def chat_stream(
         except ProviderTimeoutError as e:
             if not has_yielded:
                 _rollback_failed_turn()
-            logger.warning(f"AI Provider streaming timeout: {e}")
+            else:
+                partial_content = "".join(accumulated_chunks).strip()
+                if partial_content:
+                    try:
+                        supabase.table("ai_messages").insert({
+                            "conversation_id": conversation_id,
+                            "user_id": user_id,
+                            "role": "assistant",
+                            "content": partial_content + "\n...[response interrupted by timeout]",
+                            "model_id": model_id
+                        }).execute()
+                    except Exception as db_err:
+                        logger.warning(f"Failed to persist partial stream message: {db_err}")
+            logger.warning(f"AI Provider streaming timeout (has_yielded={has_yielded}): {e}")
             yield f"data: {json.dumps({'type': 'error', 'detail': 'The AI response took too long. Please try again.'})}\n\n"
         except RateLimitError as e:
             if not has_yielded:
