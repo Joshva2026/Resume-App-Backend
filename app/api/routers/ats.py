@@ -78,7 +78,7 @@ async def parse_saved_resume(
     Directly converts an existing ResumeForge AI saved resume into an ATS document
     without requiring the user to download and re-upload files.
     """
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(user_id=user_id, request=request)
     
     try:
         resume_res = supabase.table("resumes").select("*").eq("id", resume_id).eq("user_id", user_id).execute()
@@ -208,7 +208,7 @@ async def analyze_resume(
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase_client)
 ):
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(user_id=user_id, request=request)
     
     # Fetch from DB
     try:

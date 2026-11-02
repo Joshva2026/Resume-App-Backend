@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 import time
-from typing import Dict
+from typing import Dict, Optional
 import json
+import logging
 from app.schemas.ai import AIRequest, AIResponse, ResumePolishRequest, ResumePolishResponse
 from app.services.nvidia_provider import NvidiaAIProvider
 from app.services.ai_provider import (
@@ -16,53 +17,52 @@ from app.services.ai_provider import (
     MalformedResponseError
 )
 from app.core.config import settings
+from app.api.deps import get_current_user_id
+from app.core.rate_limiter import ai_rate_limiter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
-# Simple in-memory rate limiting (for demo/MVP purposes)
-# In production, use Redis or a proper rate limiting library
-_rate_limits: Dict[str, list] = {}
+# Backwards compatible alias for tests and legacy callers
+_rate_limits: Dict[str, list] = ai_rate_limiter.raw_history
 
 def get_ai_provider() -> AIProvider:
     return NvidiaAIProvider()
 
-def check_rate_limit(client_ip: str):
-    now = time.time()
-    minute_ago = now - 60
-    
-    # Clean up old requests
-    if client_ip in _rate_limits:
-        _rate_limits[client_ip] = [t for t in _rate_limits[client_ip] if t > minute_ago]
-    else:
-        _rate_limits[client_ip] = []
-        
-    if len(_rate_limits[client_ip]) >= settings.AI_RATE_LIMIT_PER_MINUTE:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded for AI requests")
-        
-    _rate_limits[client_ip].append(now)
+def check_rate_limit(
+    client_ip: Optional[str] = None,
+    user_id: Optional[str] = None,
+    request: Optional[Request] = None
+):
+    """
+    Enforces per-user rate limit (falling back to client IP).
+    Maintains full backwards compatibility with legacy callers passing a single argument.
+    """
+    ai_rate_limiter.check(user_id=user_id, client_ip=client_ip, request=request)
 
 @router.post("/test", response_model=AIResponse)
 async def test_ai_provider(
     request: Request,
     ai_request: AIRequest,
+    user_id: str = Depends(get_current_user_id),
     provider: AIProvider = Depends(get_ai_provider)
 ):
     """
-    Test endpoint for the AI provider abstraction.
-    NOTE: In a real environment, this should be protected by the auth middleware.
+    Protected test endpoint for the AI provider abstraction.
+    Requires authenticated user, enforces rate limits, payload size limits, and concurrency limits.
     """
-    client_ip = request.client.host if request.client else "unknown"
-    check_rate_limit(client_ip)
+    check_rate_limit(user_id=user_id, request=request)
     
-    # Payload size validation (basic)
-    if len(ai_request.system_prompt) + len(ai_request.user_prompt) > 20000:
-        raise HTTPException(status_code=400, detail="Prompt too large")
+    # Payload size validation (bounded prompt combination)
+    if len(ai_request.system_prompt) + len(ai_request.user_prompt) > 15000:
+        raise HTTPException(status_code=400, detail="Combined prompt length too large")
 
+    await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
     try:
         response = await provider.generate(ai_request)
         return response
     except ProviderAuthenticationError:
-        # Don't expose internal auth failures directly, but log securely internally
         raise HTTPException(status_code=500, detail="AI Provider configuration error")
     except ProviderUnavailableError:
         raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
@@ -77,33 +77,34 @@ async def test_ai_provider(
     except AIException as e:
         raise HTTPException(status_code=500, detail="An error occurred processing the AI request")
     except Exception as e:
-        # Fallback for unexpected errors
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
 
 @router.post("/test-provider")
 async def test_provider_connectivity(
     request: Request,
+    user_id: str = Depends(get_current_user_id),
     provider: AIProvider = Depends(get_ai_provider)
 ):
     """
     Isolated connectivity test for the NVIDIA provider.
-    Bypasses DB and parsing to test just the provider connection, auth, and model config.
+    Requires authentication to protect against unauthenticated API credit exhaustion.
     """
-    client_ip = request.client.host if request.client else "unknown"
-    check_rate_limit(client_ip)
+    check_rate_limit(user_id=user_id, request=request)
     
     ai_req = AIRequest(
         system_prompt="Return the word OK.",
         user_prompt="Return the word OK.",
         temperature=0.1,
-        max_tokens=10,
+        max_tokens=16,
         model_id=settings.NVIDIA_MODEL
     )
     
+    await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
     try:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info("=== NVIDIA CONNECTIVITY TEST ===")
+        logger.info(f"user_id={user_id}")
         logger.info(f"endpoint={settings.NVIDIA_BASE_URL}")
         logger.info(f"model={settings.NVIDIA_MODEL}")
         
@@ -115,17 +116,18 @@ async def test_provider_connectivity(
         logger.info("result=FAIL")
         logger.info(f"error_type={e.__class__.__name__}")
         logger.error(f"Test provider failed: {str(e)}")
-        # Raise explicitly so the caller sees the error type
         raise HTTPException(status_code=500, detail=f"Connectivity test failed: {e.__class__.__name__} - {str(e)}")
+    finally:
+        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
 
 @router.post("/resume/polish", response_model=ResumePolishResponse)
 async def polish_resume_section(
     request: Request,
     polish_req: ResumePolishRequest,
+    user_id: str = Depends(get_current_user_id),
     provider: AIProvider = Depends(get_ai_provider)
 ):
-    client_ip = request.client.host if request.client else "unknown"
-    check_rate_limit(client_ip)
+    check_rate_limit(user_id=user_id, request=request)
 
     # Factuality constraints
     system_prompt = f"""
@@ -155,12 +157,12 @@ CRITICAL RULES:
         model_id=settings.NVIDIA_MODEL
     )
 
+    await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
     try:
         response = await provider.generate(ai_req)
         
         # Parse JSON
         try:
-            # Strip potential markdown blocks if model misbehaves
             content = response.content.strip()
             
             import re
@@ -196,3 +198,5 @@ CRITICAL RULES:
         raise HTTPException(status_code=500, detail="An error occurred processing the AI request")
     except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)

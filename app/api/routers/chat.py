@@ -16,8 +16,9 @@ from app.services.ai_provider import (
     RateLimitError,
     MalformedResponseError,
 )
-from app.schemas.ai import AIRequest
+from app.schemas.ai import AIRequest, ChatMessageRequest
 from app.core.config import settings
+from app.core.rate_limiter import ai_rate_limiter
 import uuid
 import logging
 
@@ -45,12 +46,6 @@ CRITICAL RULES:
 """
 
 router = APIRouter(prefix="/ai", tags=["chat"])
-
-class ChatMessageRequest(BaseModel):
-    conversation_id: Optional[str] = None
-    message: str
-    model_id: Optional[str] = None
-    model_config = {"protected_namespaces": ()}
 
 class ChatMessageResponse(BaseModel):
     conversation_id: str
@@ -136,8 +131,7 @@ async def chat(
     supabase: Client = Depends(get_supabase_client),
     provider: AIProvider = Depends(get_ai_provider)
 ):
-    client_ip = request.client.host if request.client else "unknown"
-    check_rate_limit(client_ip)
+    check_rate_limit(user_id=user_id, request=request)
     
     if not chat_req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -215,6 +209,7 @@ async def chat(
         model_id=model_id
     )
     
+    await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
     try:
         response = await provider.generate(ai_req)
         assistant_content = response.content
@@ -268,6 +263,8 @@ async def chat(
         _rollback_failed_turn()
         logger.error(f"Unexpected AI Assistant Error: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Assistant is temporarily unavailable. Please try again.")
+    finally:
+        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
 
 @router.post("/chat/stream")
 async def chat_stream(
@@ -277,12 +274,11 @@ async def chat_stream(
     supabase: Client = Depends(get_supabase_client),
     provider: AIProvider = Depends(get_ai_provider)
 ):
-    client_ip = request.client.host if request.client else "unknown"
-    check_rate_limit(client_ip)
-    
+    check_rate_limit(user_id=user_id, request=request)
     if not chat_req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-        
+    await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
+    
     model_id = chat_req.model_id if chat_req.model_id else settings.NVIDIA_MODEL
     conversation_id = chat_req.conversation_id
     
@@ -477,6 +473,7 @@ async def chat_stream(
                     await producer_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
 
     return StreamingResponse(
         event_generator(),
