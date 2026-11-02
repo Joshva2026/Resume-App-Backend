@@ -395,10 +395,13 @@ async def chat_stream(
 
             if await request.is_disconnected():
                 logger.info("Chat stream aborted cleanly on client disconnect")
+                if not has_yielded:
+                    _rollback_failed_turn()
                 return
 
             full_content = "".join(accumulated_chunks)
             if full_content.strip():
+                final_model = getattr(ai_req, "model_id", None) or model_id
                 # Persist assistant message
                 try:
                     supabase.table("ai_messages").insert({
@@ -406,13 +409,13 @@ async def chat_stream(
                         "user_id": user_id,
                         "role": "assistant",
                         "content": full_content,
-                        "model_id": model_id
+                        "model_id": final_model
                     }).execute()
-                    supabase.table("ai_conversations").update({"model_id": model_id}).eq("id", conversation_id).execute()
+                    supabase.table("ai_conversations").update({"model_id": final_model}).eq("id", conversation_id).execute()
                 except Exception as db_err:
                     logger.error(f"Failed to persist assistant stream message: {db_err}")
 
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id, 'message': full_content, 'model_id': model_id})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id, 'message': full_content, 'model_id': final_model})}\n\n"
             else:
                 if not has_yielded:
                     _rollback_failed_turn()

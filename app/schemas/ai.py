@@ -5,14 +5,22 @@ from app.core.config import settings
 def get_allowed_models() -> set[str]:
     """Returns the set of server-permitted AI model IDs."""
     models = set()
-    if getattr(settings, "NVIDIA_MODEL", None):
+    if getattr(settings, "NVIDIA_MODEL", None) and settings.NVIDIA_MODEL:
         models.add(settings.NVIDIA_MODEL.strip())
-    if getattr(settings, "ATS_GROQ_MODEL", None):
+    if getattr(settings, "NVIDIA_FALLBACK_MODEL", None) and settings.NVIDIA_FALLBACK_MODEL:
+        models.add(settings.NVIDIA_FALLBACK_MODEL.strip())
+    if getattr(settings, "ATS_GROQ_MODEL", None) and settings.ATS_GROQ_MODEL:
         models.add(settings.ATS_GROQ_MODEL.strip())
-    if getattr(settings, "ATS_GROK_MODEL", None):
+    if getattr(settings, "ATS_GROK_MODEL", None) and settings.ATS_GROK_MODEL:
         models.add(settings.ATS_GROK_MODEL.strip())
     # Baseline defaults in case config is sparse
-    models.update({"openai/gpt-oss-20b", "openai/gpt-oss-120b", "grok-2-latest"})
+    models.update({
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "grok-2-latest",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    })
     return models
 
 class AIRequest(BaseModel):

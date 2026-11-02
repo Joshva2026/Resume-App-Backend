@@ -10,11 +10,13 @@ class Settings(BaseSettings):
     NVIDIA_API_KEY: Optional[str] = None
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
     NVIDIA_MODEL: str = "openai/gpt-oss-20b"
+    NVIDIA_FALLBACK_MODEL: Optional[str] = "nvidia/nemotron-3.5-lightning-30b-a3b"
     
     # AI Limits
     AI_RATE_LIMIT_PER_MINUTE: int = 10
     AI_REQUEST_TIMEOUT_SECONDS: int = 70
     AI_CONNECT_TIMEOUT_SECONDS: int = 10
+    AI_FIRST_TOKEN_TIMEOUT_SECONDS: float = 15.0
     # Streaming read/idle timeout is disabled (None) to allow long generations to complete
     AI_STREAM_READ_TIMEOUT_SECONDS: Optional[int] = None
     AI_INTER_CHUNK_TIMEOUT_SECONDS: Optional[int] = None

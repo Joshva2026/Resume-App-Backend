@@ -44,6 +44,15 @@ class NvidiaAIProvider(AIProvider):
         return connect_timeout, read_timeout, stream_read_timeout, inter_chunk_timeout
 
     @classmethod
+    def get_first_token_timeout(cls) -> float:
+        configured = getattr(settings, "AI_FIRST_TOKEN_TIMEOUT_SECONDS", 15.0)
+        try:
+            val = float(configured)
+        except (ValueError, TypeError):
+            val = 15.0
+        return max(3.0, min(val, 45.0))
+
+    @classmethod
     def get_client(cls) -> httpx.AsyncClient:
         current_loop = None
         try:
@@ -131,8 +140,8 @@ class NvidiaAIProvider(AIProvider):
         
         # Payload size diagnostic
         payload_chars = sum(len(m.get("content", "")) for m in messages)
-        
         client = self.get_client()
+
         for attempt in range(1, max_retries + 1):
                 try:
                     logger.info("=== NVIDIA DIAGNOSTIC ===")
@@ -185,9 +194,9 @@ class NvidiaAIProvider(AIProvider):
                         if finish_reason == "length":
                             logger.warning("NVIDIA response truncated due to length/max_tokens.")
                             
-                    logger.info(f"result=SUCCESS")
+                    logger.info("result=SUCCESS")
                     logger.info(f"status_code={response.status_code}")
-                    return self._parse_response(data)
+                    return self._parse_response(data, model=actual_model)
                     
                 except httpx.ReadTimeout as e:
                     duration_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
@@ -214,13 +223,13 @@ class NvidiaAIProvider(AIProvider):
                     if attempt == max_retries:
                         raise ProviderTimeoutError("The AI response took too long. Please try again.")
                 except (ProviderUnavailableError, RateLimitError) as e:
-                    logger.info(f"result=HTTP_ERROR")
+                    logger.info("result=HTTP_ERROR")
                     if attempt == max_retries:
                         raise e
                 except Exception as e:
                     if isinstance(e, AIException):
                         raise e # Don't retry auth errors, invalid requests, etc
-                    logger.info(f"result=HTTP_ERROR")
+                    logger.info("result=HTTP_ERROR")
                     logger.error(f"Unexpected NVIDIA error: {str(e)}")
                     if attempt == max_retries:
                         raise ProviderUnavailableError("Unexpected error communicating with AI provider")
@@ -251,17 +260,17 @@ class NvidiaAIProvider(AIProvider):
             messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
             
         messages.append({"role": "user", "content": request.user_prompt})
-        actual_model = (request.model_id or self.model or getattr(settings, "NVIDIA_MODEL", "openai/gpt-oss-20b")).strip()
         
-        payload = {
-            "model": actual_model,
-            "messages": messages,
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-            "stream": True
-        }
-        
+        primary_model = (request.model_id or self.model or getattr(settings, "NVIDIA_MODEL", "openai/gpt-oss-20b")).strip()
+        models_to_try = [primary_model]
+        raw_fallback = getattr(settings, "NVIDIA_FALLBACK_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
+        if isinstance(raw_fallback, str) and raw_fallback.strip():
+            fallback_model = raw_fallback.strip()
+            if fallback_model != primary_model:
+                models_to_try.append(fallback_model)
+
         connect_timeout, default_read_timeout, configured_stream_read, configured_inter_chunk = self.get_effective_timeouts()
+        first_token_timeout = self.get_first_token_timeout()
         
         # Read timeout is disabled (None) for streaming by default so valid long generations are not terminated.
         # Can still be overridden by request.timeout if explicitly specified by caller.
@@ -277,40 +286,97 @@ class NvidiaAIProvider(AIProvider):
         
         payload_chars = sum(len(m.get("content", "")) for m in messages)
         host = self.base_url.split("://")[-1].split("/")[0] if "://" in self.base_url else self.base_url
-        logger.info(
-            f"AI_STREAM_START model={actual_model} host={host} connect_to={connect_timeout}s "
-            f"stream_read_to={stream_read_timeout} max_tokens={request.max_tokens} payload_chars={payload_chars}"
-        )
-        
         client = self.get_client()
         clean_base_url = self.base_url.rstrip('/')
         
-        import time
-        t_start = time.time()
-        first_token_time = None
-        last_chunk_time = t_start
-        max_inter_chunk_gap = 0.0
-        content_chunks_count = 0
-        content_chars_count = 0
-        reasoning_chunks_count = 0
-        accumulated_reasoning = []
-        finish_reason = None
-        
-        try:
-            async with client.stream(
+        async def _stream_model(model_name: str, is_fallback: bool = False):
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+                "stream": True
+            }
+            logger.info(
+                f"AI_STREAM_START model={model_name} is_fallback={is_fallback} host={host} "
+                f"connect_to={connect_timeout}s stream_read_to={stream_read_timeout}s "
+                f"first_token_to={first_token_timeout}s max_tokens={request.max_tokens} payload_chars={payload_chars}"
+            )
+
+            import time
+            t_start = time.time()
+            t_first_token_deadline = t_start + first_token_timeout
+            first_token_time = None
+            last_chunk_time = t_start
+            max_inter_chunk_gap = 0.0
+            content_chunks_count = 0
+            content_chars_count = 0
+            reasoning_chunks_count = 0
+            accumulated_reasoning = []
+            finish_reason = None
+
+            response_cm = client.stream(
                 "POST",
                 f"{clean_base_url}/chat/completions",
                 json=payload,
                 headers=headers,
                 timeout=timeout_config
-            ) as response:
+            )
+
+            response = None
+            try:
+                # Wait for HTTP response headers bounded by remaining first_token_timeout
+                time_for_headers = max(0.1, t_first_token_deadline - time.time())
+                try:
+                    response = await asyncio.wait_for(response_cm.__aenter__(), timeout=time_for_headers)
+                except (asyncio.TimeoutError, TimeoutError):
+                    duration_ms = int((time.time() - t_start) * 1000)
+                    logger.warning(
+                        f"AI Provider streaming first-token timeout on {model_name} after {duration_ms}ms "
+                        f"(waiting for headers, threshold={first_token_timeout}s)"
+                    )
+                    raise httpx.ReadTimeout(f"First-token timeout after {first_token_timeout}s waiting for headers on {model_name}")
+
                 ttfb = time.time() - t_start
-                logger.info(f"AI_STREAM_RESPONSE status={response.status_code} ttfb={int(ttfb*1000)}ms model={actual_model}")
+                logger.info(f"AI_STREAM_RESPONSE status={response.status_code} ttfb={int(ttfb*1000)}ms model={model_name}")
                 if response.status_code != 200:
                     await response.aread()
-                    self._handle_http_errors(response, actual_model, self.base_url)
+                    self._handle_http_errors(response, model_name, self.base_url)
                 
-                async for line in response.aiter_lines():
+                line_iter = response.aiter_lines().__aiter__()
+                while True:
+                    if first_token_time is None:
+                        time_for_token = max(0.1, t_first_token_deadline - time.time())
+                        try:
+                            line = await asyncio.wait_for(line_iter.__anext__(), timeout=time_for_token)
+                        except (asyncio.TimeoutError, TimeoutError):
+                            duration_ms = int((time.time() - t_start) * 1000)
+                            logger.warning(
+                                f"AI Provider streaming first-token timeout on {model_name} after {duration_ms}ms "
+                                f"(waiting for content, threshold={first_token_timeout}s, chunks={content_chunks_count})"
+                            )
+                            raise httpx.ReadTimeout(f"First-token timeout after {first_token_timeout}s on {model_name}")
+                        except StopAsyncIteration:
+                            break
+                    else:
+                        if configured_inter_chunk is not None:
+                            try:
+                                line = await asyncio.wait_for(line_iter.__anext__(), timeout=configured_inter_chunk)
+                            except (asyncio.TimeoutError, TimeoutError):
+                                duration_ms = int((time.time() - t_start) * 1000)
+                                logger.warning(
+                                    f"AI Provider streaming inter-chunk timeout on {model_name} after {duration_ms}ms "
+                                    f"(threshold={configured_inter_chunk}s)"
+                                )
+                                raise httpx.ReadTimeout(f"Inter-chunk timeout after {configured_inter_chunk}s on {model_name}")
+                            except StopAsyncIteration:
+                                break
+                        else:
+                            try:
+                                line = await line_iter.__anext__()
+                            except StopAsyncIteration:
+                                break
+
                     if not line:
                         continue
                     if line.startswith(":"):
@@ -323,7 +389,7 @@ class NvidiaAIProvider(AIProvider):
                         try:
                             chunk = json.loads(data_str)
                             if "error" in chunk and chunk["error"]:
-                                self._handle_stream_error(chunk["error"], actual_model)
+                                self._handle_stream_error(chunk["error"], model_name)
                                 
                             choices = chunk.get("choices", [])
                             if choices:
@@ -343,7 +409,7 @@ class NvidiaAIProvider(AIProvider):
                                 if content:
                                     if first_token_time is None:
                                         first_token_time = now - t_start
-                                        logger.info(f"AI_STREAM_FIRST_TOKEN ttft={int(first_token_time*1000)}ms model={actual_model}")
+                                        logger.info(f"AI_STREAM_FIRST_TOKEN ttft={int(first_token_time*1000)}ms model={model_name}")
                                     content_chunks_count += 1
                                     content_chars_count += len(content)
                                     yield content
@@ -357,60 +423,86 @@ class NvidiaAIProvider(AIProvider):
                         except Exception:
                             continue
 
-                # Requirement 4: Distinguish reasoning metadata from user-facing answer content.
-                # If no user content chunks were emitted, NEVER yield internal reasoning as answer fallback.
+                # Requirement: Distinguish reasoning metadata from user-facing answer content.
                 if content_chunks_count == 0:
                     if accumulated_reasoning:
                         logger.warning(
-                            f"Model {actual_model} emitted only reasoning metadata ({reasoning_chunks_count} chunks) "
+                            f"Model {model_name} emitted only reasoning metadata ({reasoning_chunks_count} chunks) "
                             "without any user-facing answer content."
                         )
                         raise MalformedResponseError("Model emitted reasoning metadata without final answer content")
                     else:
-                        logger.warning(f"Model {actual_model} completed stream with 0 content chunks.")
+                        logger.warning(f"Model {model_name} completed stream with 0 content chunks.")
                         raise MalformedResponseError("AI provider completed without emitting answer content")
 
                 total_duration_ms = int((time.time() - t_start) * 1000)
                 ttft_ms = int(first_token_time * 1000) if first_token_time else None
                 logger.info(
-                    f"AI_STREAM_METRICS model={actual_model} duration_ms={total_duration_ms} "
+                    f"AI_STREAM_METRICS model={model_name} duration_ms={total_duration_ms} "
                     f"ttfb_ms={int(ttfb*1000)} ttft_ms={ttft_ms} chunks={content_chunks_count} "
                     f"chars={content_chars_count} reasoning_chunks={reasoning_chunks_count} "
                     f"max_inter_chunk_ms={int(max_inter_chunk_gap*1000)} finish_reason={finish_reason}"
                 )
+            finally:
+                if response is not None:
+                    await response_cm.__aexit__(None, None, None)
 
-        except httpx.ReadTimeout:
-            duration_ms = int((time.time() - t_start) * 1000)
-            logger.warning(
-                f"AI Provider streaming read timeout on {actual_model} after {duration_ms}ms "
-                f"(category=read_timeout, content_chunks={content_chunks_count}, chars={content_chars_count})"
-            )
-            raise ProviderTimeoutError("The AI response took too long. Please try again.")
-        except httpx.ConnectTimeout:
-            duration_ms = int((time.time() - t_start) * 1000)
-            logger.warning(f"AI Provider streaming connect timeout on {actual_model} after {duration_ms}ms (category=connect_timeout)")
-            raise ProviderTimeoutError("Failed to connect to AI provider in time")
-        except httpx.ConnectError as e:
-            duration_ms = int((time.time() - t_start) * 1000)
-            logger.warning(f"AI Provider streaming connection error after {duration_ms}ms: {e} (category=connect_error)")
-            raise ProviderUnavailableError("Unable to establish connection to AI provider")
-        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
-            duration_ms = int((time.time() - t_start) * 1000)
-            logger.warning(f"AI Provider streaming transport disconnect after {duration_ms}ms: {e} (category=disconnect)")
-            raise ProviderUnavailableError("AI provider connection was interrupted")
-        except httpx.TimeoutException:
-            duration_ms = int((time.time() - t_start) * 1000)
-            logger.warning(f"AI Provider streaming generic timeout after {duration_ms}ms (category=generic_timeout)")
-            raise ProviderTimeoutError("The AI response took too long. Please try again.")
-        except asyncio.CancelledError:
-            duration_ms = int((time.time() - t_start) * 1000)
-            logger.info(f"AI Provider stream cancelled by caller after {duration_ms}ms (chunks={content_chunks_count})")
-            raise
-        except Exception as e:
-            if isinstance(e, AIException):
-                raise e
-            logger.error(f"Unexpected streaming error on {actual_model}: {str(e)}")
-            raise ProviderUnavailableError("Unexpected error communicating with AI provider")
+        # Iterate over models with safe fallback
+        has_yielded = False
+        for idx, model_to_use in enumerate(models_to_try):
+            is_fallback = (idx > 0)
+            is_last = (idx == len(models_to_try) - 1)
+            stream_gen = _stream_model(model_to_use, is_fallback=is_fallback)
+
+            try:
+                async for chunk in stream_gen:
+                    has_yielded = True
+                    try:
+                        request.model_id = model_to_use
+                    except Exception:
+                        pass
+                    yield chunk
+                # Stream completed successfully
+                return
+            except (httpx.ReadTimeout, httpx.TimeoutException, httpx.ConnectTimeout, httpx.ConnectError,
+                    httpx.RemoteProtocolError, httpx.ReadError, ProviderTimeoutError, ProviderUnavailableError, MalformedResponseError) as err:
+                # If chunks were already yielded to consumer, NEVER fallback (prevents duplicate response)
+                if has_yielded:
+                    logger.warning(f"AI Provider streaming error after content yielded on {model_to_use}: {err}")
+                    if isinstance(err, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException, ProviderTimeoutError)):
+                        raise ProviderTimeoutError("The AI response took too long. Please try again.")
+                    elif isinstance(err, (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, ProviderUnavailableError)):
+                        raise ProviderUnavailableError("AI provider connection was interrupted")
+                    raise err
+
+                if not is_last:
+                    next_model = models_to_try[idx + 1]
+                    err_name = type(err).__name__
+                    logger.warning(
+                        f"AI Provider streaming failed on model '{model_to_use}' before emitting first token "
+                        f"(reason={err_name}: {str(err)}). "
+                        f"Attempting safe fallback to model '{next_model}'."
+                    )
+                    continue
+                else:
+                    logger.warning(f"AI Provider streaming failed on final model '{model_to_use}' (category={type(err).__name__}): {err}")
+                    if isinstance(err, (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException, ProviderTimeoutError)):
+                        raise ProviderTimeoutError("The AI response took too long. Please try again.")
+                    elif isinstance(err, (httpx.ConnectError, ProviderUnavailableError)):
+                        raise ProviderUnavailableError("Unable to establish connection to AI provider")
+                    elif isinstance(err, (httpx.RemoteProtocolError, httpx.ReadError)):
+                        raise ProviderUnavailableError("AI provider connection was interrupted")
+                    raise err
+            except asyncio.CancelledError:
+                logger.info(f"AI Provider stream cancelled by caller on model {model_to_use}")
+                raise
+            except Exception as e:
+                if isinstance(e, AIException):
+                    raise e
+                logger.error(f"Unexpected streaming error on {model_to_use}: {str(e)}")
+                raise ProviderUnavailableError("Unexpected error communicating with AI provider")
+            finally:
+                await stream_gen.aclose()
 
     def _handle_stream_error(self, err_obj: dict, actual_model: str):
         err_msg = err_obj.get("message") or "Unknown AI provider error"
@@ -456,7 +548,7 @@ class NvidiaAIProvider(AIProvider):
             logger.error(f"NVIDIA API unexpected status {status}: {sanitized_text}")
             raise AIException(f"AI provider returned status {status}")
 
-    def _parse_response(self, data: dict) -> AIResponse:
+    def _parse_response(self, data: dict, model: Optional[str] = None) -> AIResponse:
         try:
             choices = data.get("choices", [])
             if not choices:
@@ -494,7 +586,7 @@ class NvidiaAIProvider(AIProvider):
             return AIResponse(
                 content=content,
                 provider="nvidia",
-                model=data.get("model", self.model),
+                model=data.get("model") or model or self.model,
                 usage=usage,
                 finish_reason=finish_reason
             )
