@@ -6,11 +6,11 @@ from app.main import app
 from app.api.deps import get_current_user_id, get_supabase_client
 from app.api.routers.ai import get_ai_provider, _rate_limits
 from app.core.rate_limiter import ai_rate_limiter
-from app.services.ai_provider import AIResponse, AIResponseUsage
+from app.schemas.ai import AIResponse, AIResponseUsage
 from app.services.ats_cache import AtsAnalysisCache
 from app.services.ats_parser import AtsParser
 from app.services.ats_scorer import AtsScorer
-from app.schemas.ats import AtsReport, KeywordAnalysis
+from app.schemas.ats import AtsReport
 
 client = TestClient(app)
 
@@ -115,8 +115,8 @@ def test_ats_parse_saved_resume_supports_legacy_title_column():
 def test_ats_scorer_handles_none_section_scores():
     scorer = AtsScorer()
     result = scorer.calculate_deterministic_semantics(
-        resume_text="Experienced software engineer using Python and FastAPI.",
-        jd_text="Need Python developer",
+        text="Experienced software engineer using Python and FastAPI.",
+        jd="Need Python developer",
         target_role="Backend Engineer",
         section_scores={
             "Completeness": None,
@@ -136,7 +136,7 @@ def test_ats_cache_purges_expired_before_eviction():
         ats_document_id="d1",
         overall_score=80,
         section_scores={},
-        keyword_analysis=KeywordAnalysis(matched=[], missing=[]),
+        keyword_analysis={"matched": [], "missing": []},
         recommendations=[],
         strengths=[],
     )

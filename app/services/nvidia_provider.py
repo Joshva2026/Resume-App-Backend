@@ -535,7 +535,8 @@ class NvidiaAIProvider(AIProvider):
         
         # Sanitize response body to avoid leaking keys/tokens in case provider echoes them
         import re
-        sanitized_text = (response.text or "")[:500]
+        raw_text = response.text if isinstance(getattr(response, "text", None), str) else str(getattr(response, "text", "") or "")
+        sanitized_text = raw_text[:500]
         if self.api_key:
             sanitized_text = sanitized_text.replace(self.api_key, "[REDACTED]")
         sanitized_text = re.sub(r'nvapi-[A-Za-z0-9_-]+', '[REDACTED]', sanitized_text)
