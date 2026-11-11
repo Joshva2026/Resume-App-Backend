@@ -573,13 +573,13 @@ class AtsScorer:
 
         if len(achievement_metrics) >= 1 and verb_count >= 2:
             strengths.append(f"Includes quantifiable achievements ({', '.join(achievement_metrics[:2])}) with action verbs.")
-        if section_scores.get("Completeness", 0) >= 75:
+        if (section_scores.get("Completeness") or 0) >= 75:
             strengths.append("Standard ATS section structure present (Experience, Education, Skills).")
         if len(matched_keywords) >= 3:
             strengths.append(f"Demonstrates {len(matched_keywords)} verified competencies aligned with role requirements.")
-        elif section_scores.get("Education", 0) == 100:
+        elif (section_scores.get("Education") or 0) == 100:
             strengths.append("Academic qualifications and degrees clearly formatted.")
-        if section_scores.get("Projects", 0) == 100:
+        if (section_scores.get("Projects") or 0) == 100:
             strengths.append("Dedicated project section highlighting practical engineering experience.")
 
         if not strengths:
@@ -597,11 +597,11 @@ class AtsScorer:
             recommendations.append("Add measurable outcomes (percentages, performance gains, revenue) to experience bullets.")
         if verb_count < 3:
             recommendations.append("Start bullet points with assertive action verbs (e.g., Developed, Engineered, Optimized).")
-        if section_scores.get("Projects", 0) == 0:
+        if (section_scores.get("Projects") or 0) == 0:
             recommendations.append("Add a Projects section featuring real-world applications or open-source repositories.")
-        if section_scores.get("Completeness", 0) < 75:
+        if (section_scores.get("Completeness") or 0) < 75:
             recommendations.append("Ensure distinct section headings (Experience, Education, Skills) are explicitly labeled.")
-        if section_scores.get("Readability", 0) < 100:
+        if (section_scores.get("Readability") or 0) < 100:
             recommendations.append("Format bullet points into 1-2 concise lines to avoid unparsed content blocks.")
 
         if not recommendations:

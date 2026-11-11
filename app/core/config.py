@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = None
     GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
     ATS_GROQ_MODEL: str = "openai/gpt-oss-120b"
+
+    # CORS Origins (comma-separated list)
+    ALLOWED_ORIGINS: str = ""
     
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from app.api.routers import ai, ats, chat
 
@@ -53,6 +54,25 @@ app = FastAPI(
     description="Backend for AI Resume Builder and ATS Analyzer",
     version="1.0.0",
     lifespan=lifespan
+)
+
+from app.core.config import settings as _settings
+_configured_origins = [
+    o.strip() for o in getattr(_settings, "ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+_cors_origins = _configured_origins or [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://127.0.0.1:8000",
+    "https://localhost",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(ai.router)

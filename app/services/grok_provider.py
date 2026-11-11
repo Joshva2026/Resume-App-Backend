@@ -42,6 +42,14 @@ class XAIGrokAIProvider(AIProvider):
             current_loop = None
 
         if cls._shared_client is None or cls._shared_client.is_closed or cls._shared_loop != current_loop:
+            old_client = cls._shared_client
+            old_loop = cls._shared_loop
+            if old_client is not None and not old_client.is_closed:
+                try:
+                    if old_loop is not None and not old_loop.is_closed() and old_loop.is_running():
+                        old_loop.call_soon_threadsafe(lambda c=old_client: asyncio.ensure_future(c.aclose()))
+                except Exception:
+                    pass
             timeout_config = httpx.Timeout(
                 timeout=read_timeout,
                 connect=connect_timeout,
@@ -58,7 +66,8 @@ class XAIGrokAIProvider(AIProvider):
     async def close_client(cls):
         if cls._shared_client is not None and not cls._shared_client.is_closed:
             await cls._shared_client.aclose()
-            cls._shared_client = None
+        cls._shared_client = None
+        cls._shared_loop = None
 
     def __init__(self):
         self.api_key = settings.XAI_API_KEY

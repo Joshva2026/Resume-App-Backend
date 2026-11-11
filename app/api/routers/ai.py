@@ -115,8 +115,8 @@ async def test_provider_connectivity(
     except Exception as e:
         logger.info("result=FAIL")
         logger.info(f"error_type={e.__class__.__name__}")
-        logger.error(f"Test provider failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Connectivity test failed: {e.__class__.__name__} - {str(e)}")
+        logger.error(f"Test provider failed: {e.__class__.__name__}")
+        raise HTTPException(status_code=500, detail=f"Connectivity test failed: {e.__class__.__name__}")
     finally:
         await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
 
@@ -161,16 +161,19 @@ CRITICAL RULES:
     try:
         response = await provider.generate(ai_req)
         
-        # Parse JSON
+        # Parse JSON safely after removing reasoning blocks
         try:
-            content = response.content.strip()
-            
             import re
+            content = response.content.strip()
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 content = json_match.group(0)
-                
+
             parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                raise MalformedResponseError("AI returned non-object JSON")
             
             return ResumePolishResponse(
                 original_content=polish_req.original_content,

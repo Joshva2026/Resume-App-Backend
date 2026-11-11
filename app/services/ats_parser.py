@@ -7,6 +7,15 @@ import re
 class AtsParser:
     def parse_pdf(self, file_bytes: bytes) -> str:
         pdf = pypdf.PdfReader(BytesIO(file_bytes))
+        if pdf.is_encrypted:
+            try:
+                decrypt_result = pdf.decrypt("")
+                if not decrypt_result:
+                    raise ValueError("Uploaded PDF is password-protected and cannot be parsed")
+            except ValueError:
+                raise
+            except Exception:
+                raise ValueError("Uploaded PDF is encrypted and cannot be parsed")
         text = ""
         for page in pdf.pages:
             extracted = page.extract_text()

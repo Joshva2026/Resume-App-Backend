@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
+from datetime import datetime, timezone
 import json
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from supabase import Client
 from app.api.deps import get_current_user_id, get_supabase_client
 from app.api.routers.ai import check_rate_limit, get_ai_provider
@@ -56,10 +57,15 @@ class ChatMessageResponse(BaseModel):
 class ConversationResponse(BaseModel):
     id: str
     title: str
-    model_id: str
+    model_id: Optional[str] = "openai/gpt-oss-20b"
     created_at: str
     updated_at: str
     model_config = {"protected_namespaces": ()}
+
+    @field_validator("model_id", mode="before")
+    @classmethod
+    def default_model_id(cls, value):
+        return value or "openai/gpt-oss-20b"
 
 class MessageResponse(BaseModel):
     id: str
@@ -88,19 +94,24 @@ async def get_conversation_messages(
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase_client)
 ):
-    # Verify ownership implicitly by fetching conversation first
-    conv_check = supabase.table("ai_conversations").select("id").eq("id", conversation_id).eq("user_id", user_id).execute()
-    if not conv_check.data:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-        
     try:
+        # Verify ownership implicitly by fetching conversation first
+        conv_check = supabase.table("ai_conversations").select("id").eq("id", conversation_id).eq("user_id", user_id).execute()
+        if not conv_check.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
         response = supabase.table("ai_messages")\
             .select("*")\
             .eq("conversation_id", conversation_id)\
             .order("created_at", desc=False)\
             .execute()
         return response.data
+    except HTTPException:
+        raise
     except Exception as e:
+        if "invalid input syntax for type uuid" in str(e).lower():
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        logger.error(f"Failed to retrieve messages for conversation {conversation_id}: {e.__class__.__name__}")
         raise HTTPException(status_code=500, detail="Failed to retrieve messages")
 
 @router.delete("/conversations/{conversation_id}")
@@ -120,7 +131,12 @@ async def delete_conversation(
         
         supabase.table("ai_conversations").delete().eq("id", conversation_id).eq("user_id", user_id).execute()
         return {"status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
+        if "invalid input syntax for type uuid" in str(e).lower():
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        logger.error(f"Failed to delete conversation {conversation_id}: {e.__class__.__name__}")
         raise HTTPException(status_code=500, detail="Failed to delete conversation")
 
 @router.post("/chat", response_model=ChatMessageResponse)
@@ -224,7 +240,10 @@ async def chat(
         }).execute()
         
         # Update conversation updated_at
-        supabase.table("ai_conversations").update({"model_id": response.model}).eq("id", conversation_id).execute()
+        supabase.table("ai_conversations").update({
+            "model_id": response.model,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", conversation_id).execute()
         
         return ChatMessageResponse(
             conversation_id=conversation_id,
@@ -278,77 +297,89 @@ async def chat_stream(
     if not chat_req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
-    
-    model_id = chat_req.model_id if chat_req.model_id else settings.NVIDIA_MODEL
-    conversation_id = chat_req.conversation_id
-    
-    history_messages = []
-    is_new_conversation = False
-    
-    # 1. Create or verify conversation
-    if not conversation_id:
-        is_new_conversation = True
-        title = chat_req.message[:40] + "..." if len(chat_req.message) > 40 else chat_req.message
-        conv_res = supabase.table("ai_conversations").insert({
+    try:
+        model_id = chat_req.model_id if chat_req.model_id else settings.NVIDIA_MODEL
+        conversation_id = chat_req.conversation_id
+        
+        history_messages = []
+        is_new_conversation = False
+        
+        # 1. Create or verify conversation
+        if not conversation_id:
+            is_new_conversation = True
+            title = chat_req.message[:40] + "..." if len(chat_req.message) > 40 else chat_req.message
+            conv_res = supabase.table("ai_conversations").insert({
+                "user_id": user_id,
+                "title": title,
+                "model_id": model_id
+            }).execute()
+            if not conv_res.data:
+                raise HTTPException(status_code=500, detail="Failed to create conversation")
+            conversation_id = conv_res.data[0]["id"]
+        else:
+            try:
+                conv_check = supabase.table("ai_conversations").select("id").eq("id", conversation_id).eq("user_id", user_id).execute()
+            except Exception as db_err:
+                if "invalid input syntax for type uuid" in str(db_err).lower():
+                    raise HTTPException(status_code=404, detail="Conversation not found")
+                raise
+            if not conv_check.data:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+                
+            # Fetch bounded context (last 6 messages / 3 turns to prevent payload explosion)
+            msg_res = supabase.table("ai_messages")\
+                .select("role, content")\
+                .eq("conversation_id", conversation_id)\
+                .order("created_at", desc=True)\
+                .limit(6)\
+                .execute()
+            
+            raw_history = list(reversed(msg_res.data))
+            for m in raw_history:
+                content = m["content"]
+                if len(content) > 1500:
+                    content = content[:1500] + "\n...[truncated for length]"
+                history_messages.append({"role": m["role"], "content": content})
+            
+        # 2. Persist User Message
+        user_msg_res = supabase.table("ai_messages").insert({
+            "conversation_id": conversation_id,
             "user_id": user_id,
-            "title": title,
+            "role": "user",
+            "content": chat_req.message,
             "model_id": model_id
         }).execute()
-        if not conv_res.data:
-            raise HTTPException(status_code=500, detail="Failed to create conversation")
-        conversation_id = conv_res.data[0]["id"]
-    else:
-        conv_check = supabase.table("ai_conversations").select("id").eq("id", conversation_id).eq("user_id", user_id).execute()
-        if not conv_check.data:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-            
-        # Fetch bounded context (last 6 messages / 3 turns to prevent payload explosion)
-        msg_res = supabase.table("ai_messages")\
-            .select("role, content")\
-            .eq("conversation_id", conversation_id)\
-            .order("created_at", desc=True)\
-            .limit(6)\
-            .execute()
-        
-        raw_history = list(reversed(msg_res.data))
-        for m in raw_history:
-            content = m["content"]
-            if len(content) > 1500:
-                content = content[:1500] + "\n...[truncated for length]"
-            history_messages.append({"role": m["role"], "content": content})
-        
-    # 2. Persist User Message
-    user_msg_res = supabase.table("ai_messages").insert({
-        "conversation_id": conversation_id,
-        "user_id": user_id,
-        "role": "user",
-        "content": chat_req.message,
-        "model_id": model_id
-    }).execute()
-    user_msg_id = user_msg_res.data[0]["id"] if (user_msg_res and user_msg_res.data) else None
+        user_msg_id = user_msg_res.data[0]["id"] if (user_msg_res and user_msg_res.data) else None
 
-    # Helper function to rollback DB changes if provider generation fails before emitting tokens
-    def _rollback_failed_turn():
-        if user_msg_id:
-            try:
-                supabase.table("ai_messages").delete().eq("id", user_msg_id).execute()
-            except Exception as cleanup_err:
-                logger.warning(f"Failed to cleanup unresponded user message {user_msg_id}: {cleanup_err}")
-        if is_new_conversation and conversation_id:
-            try:
-                supabase.table("ai_conversations").delete().eq("id", conversation_id).execute()
-            except Exception as cleanup_err:
-                logger.warning(f"Failed to cleanup empty conversation {conversation_id}: {cleanup_err}")
-    
-    # 3. Generate AI Streaming Response
-    ai_req = AIRequest(
-        system_prompt=CAREER_ASSISTANT_SYSTEM_PROMPT,
-        user_prompt=chat_req.message,
-        history=history_messages,
-        temperature=0.7,
-        max_tokens=getattr(settings, "AI_MAX_TOKENS", 1536),
-        model_id=model_id
-    )
+        # Helper function to rollback DB changes if provider generation fails before emitting tokens
+        def _rollback_failed_turn():
+            if user_msg_id:
+                try:
+                    supabase.table("ai_messages").delete().eq("id", user_msg_id).execute()
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to cleanup unresponded user message {user_msg_id}: {cleanup_err}")
+            if is_new_conversation and conversation_id:
+                try:
+                    supabase.table("ai_conversations").delete().eq("id", conversation_id).execute()
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to cleanup empty conversation {conversation_id}: {cleanup_err}")
+        
+        # 3. Generate AI Streaming Response
+        ai_req = AIRequest(
+            system_prompt=CAREER_ASSISTANT_SYSTEM_PROMPT,
+            user_prompt=chat_req.message,
+            history=history_messages,
+            temperature=0.7,
+            max_tokens=getattr(settings, "AI_MAX_TOKENS", 1536),
+            model_id=model_id
+        )
+    except HTTPException:
+        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
+        raise
+    except Exception as setup_err:
+        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
+        logger.error(f"Failed to prepare chat stream: {setup_err.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Failed to start AI chat session")
 
     async def event_generator():
         import asyncio
@@ -411,7 +442,10 @@ async def chat_stream(
                         "content": full_content,
                         "model_id": final_model
                     }).execute()
-                    supabase.table("ai_conversations").update({"model_id": final_model}).eq("id", conversation_id).execute()
+                    supabase.table("ai_conversations").update({
+                        "model_id": final_model,
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }).eq("id", conversation_id).execute()
                 except Exception as db_err:
                     logger.error(f"Failed to persist assistant stream message: {db_err}")
 

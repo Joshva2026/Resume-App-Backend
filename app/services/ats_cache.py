@@ -42,6 +42,12 @@ class AtsAnalysisCache:
 
     @classmethod
     def set(cls, key: str, report: AtsReport, ttl_seconds: Optional[float] = None) -> None:
+        now = time.time()
+        if len(cls._cache) >= cls.MAX_ENTRIES:
+            expired_keys = [k for k, (exp, _) in cls._cache.items() if now > exp]
+            for expired_key in expired_keys:
+                del cls._cache[expired_key]
+
         if len(cls._cache) >= cls.MAX_ENTRIES:
             oldest_key = min(cls._cache.keys(), key=lambda k: cls._cache[k][0])
             del cls._cache[oldest_key]

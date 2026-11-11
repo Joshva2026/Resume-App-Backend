@@ -58,10 +58,21 @@ class RateLimiter:
         now = time.time()
         minute_ago = now - 60.0
 
-        # Prune expired timestamps
+        # Prune expired timestamps and drop empty entries to keep memory bounded
         history = self._history.get(key, [])
         valid_history = [t for t in history if t > minute_ago]
-        self._history[key] = valid_history
+        if valid_history:
+            self._history[key] = valid_history
+        else:
+            self._history.pop(key, None)
+
+        if len(self._history) > 500:
+            stale_keys = [
+                k for k, ts_list in self._history.items()
+                if not ts_list or ts_list[-1] <= minute_ago
+            ]
+            for stale_key in stale_keys:
+                self._history.pop(stale_key, None)
 
         limit = getattr(settings, "AI_RATE_LIMIT_PER_MINUTE", self.requests_per_minute)
         if len(valid_history) >= limit:
@@ -70,7 +81,7 @@ class RateLimiter:
                 detail=f"Rate limit exceeded. Allowed: {limit} requests per minute. Please try again shortly."
             )
 
-        self._history[key].append(now)
+        self._history.setdefault(key, []).append(now)
 
     async def acquire_concurrency(self, user_id: Optional[str] = None, client_ip: Optional[str] = None, request: Optional[Request] = None):
         """

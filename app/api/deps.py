@@ -13,20 +13,35 @@ def get_supabase_client(credentials: HTTPAuthorizationCredentials = Depends(secu
 import urllib.request
 import json
 import logging
+import threading
+import time
 logger = logging.getLogger(__name__)
 
 _jwks = None
+_jwks_fetched_at: float = 0.0
+_jwks_lock = threading.Lock()
+_JWKS_TTL_SECONDS = 3600.0
 
-def get_jwks():
-    global _jwks
-    if _jwks is None:
+def get_jwks(force_refresh: bool = False):
+    global _jwks, _jwks_fetched_at
+    now = time.time()
+    if not force_refresh and _jwks is not None and (now - _jwks_fetched_at) < _JWKS_TTL_SECONDS:
+        return _jwks
+
+    with _jwks_lock:
+        now = time.time()
+        if not force_refresh and _jwks is not None and (now - _jwks_fetched_at) < _JWKS_TTL_SECONDS:
+            return _jwks
         try:
             jwks_url = f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json"
             req = urllib.request.Request(jwks_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=10) as response:
                 _jwks = json.loads(response.read())
+                _jwks_fetched_at = time.time()
         except Exception as e:
-            logger.error(f"Failed to fetch JWKS: {e}")
+            logger.error(f"Failed to fetch JWKS: {e.__class__.__name__}")
+            if _jwks is not None:
+                return _jwks
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to load authentication keys"
@@ -78,7 +93,11 @@ def get_current_user_id(request: Request, credentials: HTTPAuthorizationCredenti
             if kid != 'none':
                 matching_keys = [k for k in jwks.get('keys', []) if k.get('kid') == kid]
                 if not matching_keys:
-                    raise JWTError(f"Unknown kid: {kid}")
+                    # Refresh once in case Supabase rotated signing keys
+                    jwks = get_jwks(force_refresh=True)
+                    matching_keys = [k for k in jwks.get('keys', []) if k.get('kid') == kid]
+                    if not matching_keys:
+                        raise JWTError(f"Unknown kid: {kid}")
             
             payload = jwt.decode(
                 token, 

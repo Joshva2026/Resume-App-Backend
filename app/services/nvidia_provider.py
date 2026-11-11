@@ -66,6 +66,14 @@ class NvidiaAIProvider(AIProvider):
             or cls._shared_client.is_closed 
             or (cls._shared_loop is not None and cls._shared_loop != current_loop)
         ):
+            old_client = cls._shared_client
+            old_loop = cls._shared_loop
+            if old_client is not None and not old_client.is_closed:
+                try:
+                    if old_loop is not None and not old_loop.is_closed() and old_loop.is_running():
+                        old_loop.call_soon_threadsafe(lambda c=old_client: asyncio.ensure_future(c.aclose()))
+                except Exception:
+                    pass
             timeout_config = httpx.Timeout(
                 timeout=read_timeout,
                 connect=connect_timeout,
@@ -526,7 +534,12 @@ class NvidiaAIProvider(AIProvider):
         logger.error(f"HTTP_FAILURE status={status} model={actual_model} host={host}")
         
         # Sanitize response body to avoid leaking keys/tokens in case provider echoes them
-        sanitized_text = response.text.replace(self.api_key or "NO_KEY", "[REDACTED]")
+        import re
+        sanitized_text = (response.text or "")[:500]
+        if self.api_key:
+            sanitized_text = sanitized_text.replace(self.api_key, "[REDACTED]")
+        sanitized_text = re.sub(r'nvapi-[A-Za-z0-9_-]+', '[REDACTED]', sanitized_text)
+        sanitized_text = re.sub(r'Bearer\s+[A-Za-z0-9._-]+', 'Bearer [REDACTED]', sanitized_text)
         
         if status == 401 or status == 403:
             logger.error(f"NVIDIA API authentication failed: {sanitized_text}")
@@ -593,5 +606,5 @@ class NvidiaAIProvider(AIProvider):
         except MalformedResponseError as e:
             raise e
         except Exception as e:
-            logger.error(f"Error parsing NVIDIA response: {str(e)} | Data: {data}")
+            logger.error(f"Error parsing NVIDIA response: {e.__class__.__name__}")
             raise MalformedResponseError("Failed to parse provider response")

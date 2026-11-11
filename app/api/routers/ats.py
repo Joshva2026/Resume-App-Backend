@@ -27,38 +27,72 @@ async def parse_resume(
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase_client)
 ):
-    check_rate_limit(request.client.host if request.client else "unknown")
-    
-    if file.content_type not in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
+    check_rate_limit(user_id=user_id, request=request)
+
+    filename_lower = (file.filename or "").lower()
+    allowed_pdf_mimes = {"application/pdf"}
+    allowed_docx_mimes = {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    }
+    content_type = (file.content_type or "").lower()
+
+    is_pdf = content_type in allowed_pdf_mimes or (
+        content_type in ("application/octet-stream", "") and filename_lower.endswith(".pdf")
+    )
+    is_docx = content_type in allowed_docx_mimes or (
+        content_type in ("application/octet-stream", "") and filename_lower.endswith(".docx")
+    )
+
+    if not is_pdf and not is_docx:
         raise HTTPException(status_code=422, detail="Only PDF and DOCX files are currently supported")
-        
+
     contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
     if len(contents) > 5 * 1024 * 1024: # 5MB limit
         raise HTTPException(status_code=422, detail="File too large")
-        
+
+    # Verify magic bytes in addition to client-supplied MIME type / extension
+    header_stripped = contents.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if is_pdf and not header_stripped.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="Invalid PDF file header")
+    if is_docx and not contents.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        raise HTTPException(status_code=422, detail="Invalid DOCX file archive header")
+
     parser = AtsParser()
     try:
-        if file.content_type == "application/pdf":
+        if is_pdf:
             raw_text = parser.parse_pdf(contents)
         else:
             raw_text = parser.parse_docx(contents)
-            
+
+        if not raw_text or not raw_text.strip():
+            raise ValueError("No selectable text found in document")
+
         structured_data = parser.structure_text(raw_text)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to parse document: {str(e)}")
-        
+        logger.warning(f"Failed to parse uploaded document for user={user_id}: {e.__class__.__name__}")
+        raise HTTPException(status_code=422, detail="Failed to parse document. Please ensure the file is not corrupted or encrypted.")
+
+    normalized_mime = "application/pdf" if is_pdf else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
     # Persist to Supabase
     try:
         response = supabase.table("ats_documents").insert({
             "user_id": user_id,
-            "file_name": file.filename,
-            "file_type": file.content_type,
+            "file_name": file.filename or ("resume.pdf" if is_pdf else "resume.docx"),
+            "file_type": normalized_mime,
             "file_size": len(contents),
             "parsed_text": raw_text,
             "parsed_structure": structured_data
         }).execute()
         doc_id = response.data[0]["id"]
     except Exception as e:
+        logger.error(f"Failed to persist parsed ATS document for user={user_id}: {e.__class__.__name__}")
         raise HTTPException(status_code=500, detail="Failed to persist document to database")
         
     return AtsParseResponse(
@@ -88,7 +122,11 @@ async def parse_saved_resume(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch resume: {str(e)}")
+        err_str = str(e).lower()
+        if "invalid input syntax for type uuid" in err_str:
+            raise HTTPException(status_code=404, detail="Resume not found")
+        logger.error(f"Failed to fetch resume {resume_id} for user={user_id}: {e.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Failed to fetch resume")
 
     resume_name = resume_data.get("resume_name") or "Saved Resume"
     
@@ -154,7 +192,8 @@ async def parse_saved_resume(
         try:
             legacy_exp = supabase.table("experiences").select("*").eq("resume_id", resume_id).execute()
             for e in legacy_exp.data:
-                exp_lines.append(f"{e.get('job_title', '')} at {e.get('company', '')}\n{e.get('description', '')}".strip())
+                role_title = e.get('title') or e.get('job_title', '')
+                exp_lines.append(f"{role_title} at {e.get('company', '')}\n{e.get('description', '')}".strip())
         except Exception:
             pass
 
@@ -193,7 +232,8 @@ async def parse_saved_resume(
         }).execute()
         doc_id = response.data[0]["id"]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to persist document to database: {str(e)}")
+        logger.error(f"Failed to persist saved-resume ATS doc for user={user_id}: {e.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Failed to persist document to database")
 
     return AtsParseResponse(
         document_id=doc_id,
