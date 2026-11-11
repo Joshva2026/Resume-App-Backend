@@ -33,13 +33,14 @@ def get_ai_provider() -> AIProvider:
 def check_rate_limit(
     client_ip: Optional[str] = None,
     user_id: Optional[str] = None,
-    request: Optional[Request] = None
+    request: Optional[Request] = None,
+    scope: Optional[str] = None,
 ):
     """
     Enforces per-user rate limit (falling back to client IP).
     Maintains full backwards compatibility with legacy callers passing a single argument.
     """
-    ai_rate_limiter.check(user_id=user_id, client_ip=client_ip, request=request)
+    ai_rate_limiter.check(user_id=user_id, client_ip=client_ip, request=request, scope=scope)
 
 @router.post("/test", response_model=AIResponse)
 async def test_ai_provider(

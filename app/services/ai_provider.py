@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 from app.schemas.ai import AIRequest, AIResponse
 
 class AIException(Exception):
@@ -18,7 +19,18 @@ class InvalidRequestError(AIException):
     pass
 
 class RateLimitError(AIException):
-    pass
+    def __init__(
+        self,
+        message: str = "AI provider rate limit exceeded",
+        *,
+        retry_after: Optional[float] = None,
+        retryable: bool = True,
+        quota_exhausted: bool = False,
+    ):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.retryable = retryable
+        self.quota_exhausted = quota_exhausted
 
 class MalformedResponseError(AIException):
     pass

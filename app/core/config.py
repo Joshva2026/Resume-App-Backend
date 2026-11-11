@@ -14,13 +14,18 @@ class Settings(BaseSettings):
     
     # AI Limits
     AI_RATE_LIMIT_PER_MINUTE: int = 10
+    AI_CHAT_RATE_LIMIT_PER_MINUTE: int = 20
+    AI_MAX_CONCURRENT_REQUESTS: int = 1
     AI_REQUEST_TIMEOUT_SECONDS: int = 70
-    AI_CONNECT_TIMEOUT_SECONDS: int = 10
-    AI_FIRST_TOKEN_TIMEOUT_SECONDS: float = 15.0
-    # Streaming read/idle timeout is disabled (None) to allow long generations to complete
-    AI_STREAM_READ_TIMEOUT_SECONDS: Optional[int] = None
-    AI_INTER_CHUNK_TIMEOUT_SECONDS: Optional[int] = None
+    AI_CONNECT_TIMEOUT_SECONDS: float = 10.0
+    AI_FIRST_TOKEN_TIMEOUT_SECONDS: float = 30.0
+    AI_FIRST_TOKEN_TIMEOUT_MAX_SECONDS: float = 60.0
+    AI_STREAM_READ_TIMEOUT_SECONDS: Optional[float] = 100.0
+    AI_STREAM_READ_TIMEOUT_MAX_SECONDS: float = 105.0
+    AI_INTER_CHUNK_TIMEOUT_SECONDS: Optional[float] = 30.0
     AI_STREAM_KEEPALIVE_INTERVAL_SECONDS: int = 15
+    AI_STREAM_429_MAX_RETRIES: int = 2
+    AI_PROVIDER_RETRY_MAX_WAIT_SECONDS: float = 8.0
     AI_MAX_TOKENS: int = 1536
     ATS_AI_TIMEOUT_SECONDS: int = 35
     

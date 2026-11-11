@@ -1,8 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime, timezone
+import asyncio
 import json
+import math
 from pydantic import BaseModel, field_validator
 from supabase import Client
 from app.api.deps import get_current_user_id, get_supabase_client
@@ -139,6 +141,23 @@ async def delete_conversation(
         logger.error(f"Failed to delete conversation {conversation_id}: {e.__class__.__name__}")
         raise HTTPException(status_code=500, detail="Failed to delete conversation")
 
+def _sse_error(
+    detail: str,
+    code: str,
+    retryable: bool = True,
+    retry_after: Optional[int] = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "type": "error",
+        "detail": detail,
+        "code": code,
+        "retryable": retryable,
+    }
+    if retry_after is not None:
+        payload["retry_after"] = retry_after
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 @router.post("/chat", response_model=ChatMessageResponse)
 async def chat(
     request: Request,
@@ -147,62 +166,20 @@ async def chat(
     supabase: Client = Depends(get_supabase_client),
     provider: AIProvider = Depends(get_ai_provider)
 ):
-    check_rate_limit(user_id=user_id, request=request)
-    
     if not chat_req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-        
-    model_id = chat_req.model_id if chat_req.model_id else settings.NVIDIA_MODEL
-    conversation_id = chat_req.conversation_id
-    
-    history_messages = []
-    is_new_conversation = False
-    
-    # 1. Create or verify conversation
-    if not conversation_id:
-        is_new_conversation = True
-        title = chat_req.message[:40] + "..." if len(chat_req.message) > 40 else chat_req.message
-        conv_res = supabase.table("ai_conversations").insert({
-            "user_id": user_id,
-            "title": title,
-            "model_id": model_id
-        }).execute()
-        if not conv_res.data:
-            raise HTTPException(status_code=500, detail="Failed to create conversation")
-        conversation_id = conv_res.data[0]["id"]
-    else:
-        conv_check = supabase.table("ai_conversations").select("id").eq("id", conversation_id).eq("user_id", user_id).execute()
-        if not conv_check.data:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-            
-        # Fetch bounded context (last 6 messages / 3 turns to prevent payload explosion)
-        msg_res = supabase.table("ai_messages")\
-            .select("role, content")\
-            .eq("conversation_id", conversation_id)\
-            .order("created_at", desc=True)\
-            .limit(6)\
-            .execute()
-        
-        # Reverse to chronological order and optionally truncate very long past messages
-        # to ensure we don't blow up the provider payload if previous outputs were massive
-        raw_history = list(reversed(msg_res.data))
-        for m in raw_history:
-            content = m["content"]
-            if len(content) > 1500:
-                content = content[:1500] + "\n...[truncated for length]"
-            history_messages.append({"role": m["role"], "content": content})
-        
-    # 2. Persist User Message
-    user_msg_res = supabase.table("ai_messages").insert({
-        "conversation_id": conversation_id,
-        "user_id": user_id,
-        "role": "user",
-        "content": chat_req.message,
-        "model_id": model_id
-    }).execute()
-    user_msg_id = user_msg_res.data[0]["id"] if (user_msg_res and user_msg_res.data) else None
 
-    # Helper function to rollback DB changes if provider generation fails
+    lock_conv_id = chat_req.conversation_id
+    await ai_rate_limiter.acquire_concurrency(
+        user_id=user_id,
+        request=request,
+        conversation_id=lock_conv_id,
+    )
+
+    user_msg_id = None
+    is_new_conversation = False
+    conversation_id = lock_conv_id
+
     def _rollback_failed_turn():
         if user_msg_id:
             try:
@@ -214,22 +191,69 @@ async def chat(
                 supabase.table("ai_conversations").delete().eq("id", conversation_id).execute()
             except Exception as cleanup_err:
                 logger.warning(f"Failed to cleanup empty conversation {conversation_id}: {cleanup_err}")
-    
-    # 3. Generate AI Response
-    ai_req = AIRequest(
-        system_prompt=CAREER_ASSISTANT_SYSTEM_PROMPT,
-        user_prompt=chat_req.message,
-        history=history_messages,
-        temperature=0.7,
-        max_tokens=getattr(settings, "AI_MAX_TOKENS", 1024),
-        model_id=model_id
-    )
-    
-    await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
+
     try:
+        check_rate_limit(user_id=user_id, request=request, scope="chat")
+
+        model_id = chat_req.model_id if chat_req.model_id else settings.NVIDIA_MODEL
+        history_messages = []
+
+        # 1. Create or verify conversation
+        if not conversation_id:
+            is_new_conversation = True
+            title = chat_req.message[:40] + "..." if len(chat_req.message) > 40 else chat_req.message
+            conv_res = supabase.table("ai_conversations").insert({
+                "user_id": user_id,
+                "title": title,
+                "model_id": model_id
+            }).execute()
+            if not conv_res.data:
+                raise HTTPException(status_code=500, detail="Failed to create conversation")
+            conversation_id = conv_res.data[0]["id"]
+        else:
+            conv_check = supabase.table("ai_conversations").select("id").eq("id", conversation_id).eq("user_id", user_id).execute()
+            if not conv_check.data:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+
+            # Fetch bounded context (last 6 messages / 3 turns to prevent payload explosion)
+            msg_res = supabase.table("ai_messages")\
+                .select("role, content")\
+                .eq("conversation_id", conversation_id)\
+                .order("created_at", desc=True)\
+                .limit(6)\
+                .execute()
+
+            # Reverse to chronological order and optionally truncate very long past messages
+            raw_history = list(reversed(msg_res.data))
+            for m in raw_history:
+                content = m["content"]
+                if len(content) > 1500:
+                    content = content[:1500] + "\n...[truncated for length]"
+                history_messages.append({"role": m["role"], "content": content})
+
+        # 2. Persist User Message
+        user_msg_res = supabase.table("ai_messages").insert({
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "role": "user",
+            "content": chat_req.message,
+            "model_id": model_id
+        }).execute()
+        user_msg_id = user_msg_res.data[0]["id"] if (user_msg_res and user_msg_res.data) else None
+
+        # 3. Generate AI Response
+        ai_req = AIRequest(
+            system_prompt=CAREER_ASSISTANT_SYSTEM_PROMPT,
+            user_prompt=chat_req.message,
+            history=history_messages,
+            temperature=0.7,
+            max_tokens=getattr(settings, "AI_MAX_TOKENS", 1024),
+            model_id=model_id
+        )
+
         response = await provider.generate(ai_req)
         assistant_content = response.content
-        
+
         # 4. Persist Assistant Message
         supabase.table("ai_messages").insert({
             "conversation_id": conversation_id,
@@ -238,18 +262,21 @@ async def chat(
             "content": assistant_content,
             "model_id": response.model
         }).execute()
-        
+
         # Update conversation updated_at
         supabase.table("ai_conversations").update({
             "model_id": response.model,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", conversation_id).execute()
-        
+
         return ChatMessageResponse(
             conversation_id=conversation_id,
             message=assistant_content,
             model_id=response.model
         )
+    except HTTPException:
+        _rollback_failed_turn()
+        raise
     except ProviderAuthenticationError as e:
         _rollback_failed_turn()
         logger.error(f"AI Provider authentication failure: {e}")
@@ -261,7 +288,18 @@ async def chat(
     except RateLimitError as e:
         _rollback_failed_turn()
         logger.warning(f"AI Provider rate limit: {e}")
-        raise HTTPException(status_code=429, detail="AI provider rate limit exceeded")
+        retry_after_sec = max(1, math.ceil(e.retry_after)) if e.retry_after is not None else None
+        headers = {"Retry-After": str(retry_after_sec)} if retry_after_sec else None
+        detail = (
+            "AI service quota has been exhausted. Please try again later."
+            if e.quota_exhausted
+            else (
+                f"AI provider rate limit exceeded. Please wait {retry_after_sec} seconds and try again."
+                if retry_after_sec
+                else "AI provider rate limit exceeded"
+            )
+        )
+        raise HTTPException(status_code=429, detail=detail, headers=headers)
     except ProviderUnavailableError as e:
         _rollback_failed_turn()
         logger.warning(f"AI Provider unavailable: {e}")
@@ -283,7 +321,11 @@ async def chat(
         logger.error(f"Unexpected AI Assistant Error: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Assistant is temporarily unavailable. Please try again.")
     finally:
-        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
+        await ai_rate_limiter.release_concurrency(
+            user_id=user_id,
+            request=request,
+            conversation_id=lock_conv_id,
+        )
 
 @router.post("/chat/stream")
 async def chat_stream(
@@ -293,17 +335,24 @@ async def chat_stream(
     supabase: Client = Depends(get_supabase_client),
     provider: AIProvider = Depends(get_ai_provider)
 ):
-    check_rate_limit(user_id=user_id, request=request)
     if not chat_req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-    await ai_rate_limiter.acquire_concurrency(user_id=user_id, request=request)
+
+    lock_conv_id = chat_req.conversation_id
+    await ai_rate_limiter.acquire_concurrency(
+        user_id=user_id,
+        request=request,
+        conversation_id=lock_conv_id,
+    )
     try:
+        check_rate_limit(user_id=user_id, request=request, scope="chat")
+
         model_id = chat_req.model_id if chat_req.model_id else settings.NVIDIA_MODEL
-        conversation_id = chat_req.conversation_id
-        
+        conversation_id = lock_conv_id
+
         history_messages = []
         is_new_conversation = False
-        
+
         # 1. Create or verify conversation
         if not conversation_id:
             is_new_conversation = True
@@ -325,7 +374,7 @@ async def chat_stream(
                 raise
             if not conv_check.data:
                 raise HTTPException(status_code=404, detail="Conversation not found")
-                
+
             # Fetch bounded context (last 6 messages / 3 turns to prevent payload explosion)
             msg_res = supabase.table("ai_messages")\
                 .select("role, content")\
@@ -333,14 +382,14 @@ async def chat_stream(
                 .order("created_at", desc=True)\
                 .limit(6)\
                 .execute()
-            
+
             raw_history = list(reversed(msg_res.data))
             for m in raw_history:
                 content = m["content"]
                 if len(content) > 1500:
                     content = content[:1500] + "\n...[truncated for length]"
                 history_messages.append({"role": m["role"], "content": content})
-            
+
         # 2. Persist User Message
         user_msg_res = supabase.table("ai_messages").insert({
             "conversation_id": conversation_id,
@@ -363,7 +412,7 @@ async def chat_stream(
                     supabase.table("ai_conversations").delete().eq("id", conversation_id).execute()
                 except Exception as cleanup_err:
                     logger.warning(f"Failed to cleanup empty conversation {conversation_id}: {cleanup_err}")
-        
+
         # 3. Generate AI Streaming Response
         ai_req = AIRequest(
             system_prompt=CAREER_ASSISTANT_SYSTEM_PROMPT,
@@ -374,33 +423,43 @@ async def chat_stream(
             model_id=model_id
         )
     except HTTPException:
-        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
+        await ai_rate_limiter.release_concurrency(
+            user_id=user_id,
+            request=request,
+            conversation_id=lock_conv_id,
+        )
         raise
     except Exception as setup_err:
-        await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
+        await ai_rate_limiter.release_concurrency(
+            user_id=user_id,
+            request=request,
+            conversation_id=lock_conv_id,
+        )
         logger.error(f"Failed to prepare chat stream: {setup_err.__class__.__name__}")
         raise HTTPException(status_code=500, detail="Failed to start AI chat session")
 
     async def event_generator():
-        import asyncio
         # Immediately emit an initial SSE comment to flush HTTP 200 headers to client and proxy
         yield ": ping\n\n"
-        
-        queue: asyncio.Queue[tuple[str, any]] = asyncio.Queue()
-        
+
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
         async def producer():
             try:
                 async for token in provider.generate_stream(ai_req):
                     await queue.put(("chunk", token))
                 await queue.put(("done", None))
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 await queue.put(("error", e))
 
         producer_task = asyncio.create_task(producer())
         accumulated_chunks = []
         has_yielded = False
-        keepalive_interval = float(getattr(settings, "AI_STREAM_KEEPALIVE_INTERVAL_SECONDS", 15))
-        
+        raw_keepalive = getattr(settings, "AI_STREAM_KEEPALIVE_INTERVAL_SECONDS", 15)
+        keepalive_interval = float(raw_keepalive) if isinstance(raw_keepalive, (int, float)) and not isinstance(raw_keepalive, bool) else 15.0
+
         try:
             while True:
                 if await request.is_disconnected():
@@ -411,6 +470,10 @@ async def chat_stream(
                 try:
                     event_type, payload = await asyncio.wait_for(queue.get(), timeout=keepalive_interval)
                 except (asyncio.TimeoutError, TimeoutError):
+                    if await request.is_disconnected():
+                        logger.info("Client disconnected during keepalive interval; aborting producer")
+                        producer_task.cancel()
+                        break
                     # Emitting periodic SSE comment resets proxy and client idle timers without visible text contamination
                     yield ": keepalive\n\n"
                     continue
@@ -453,13 +516,21 @@ async def chat_stream(
             else:
                 if not has_yielded:
                     _rollback_failed_turn()
-                yield f"data: {json.dumps({'type': 'error', 'detail': 'Empty response received from AI service'})}\n\n"
+                yield _sse_error(
+                    detail="Empty response received from AI service",
+                    code="empty_response",
+                    retryable=True,
+                )
 
         except ProviderAuthenticationError as e:
             if not has_yielded:
                 _rollback_failed_turn()
             logger.error(f"AI Provider streaming authentication failure: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'AI Provider configuration error'})}\n\n"
+            yield _sse_error(
+                detail="AI Provider configuration error",
+                code="provider_auth_error",
+                retryable=False,
+            )
         except ProviderTimeoutError as e:
             if not has_yielded:
                 _rollback_failed_turn()
@@ -477,32 +548,70 @@ async def chat_stream(
                     except Exception as db_err:
                         logger.warning(f"Failed to persist partial stream message: {db_err}")
             logger.warning(f"AI Provider streaming timeout (has_yielded={has_yielded}): {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'The AI response took too long. Please try again.'})}\n\n"
+            yield _sse_error(
+                detail="The AI response took too long. Please try again.",
+                code="provider_timeout",
+                retryable=True,
+            )
         except RateLimitError as e:
             if not has_yielded:
                 _rollback_failed_turn()
-            logger.warning(f"AI Provider streaming rate limit: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'AI provider rate limit exceeded'})}\n\n"
+            logger.warning(f"AI Provider streaming rate limit (quota_exhausted={e.quota_exhausted}, retry_after={e.retry_after}): {e}")
+            retry_after_sec = max(1, math.ceil(e.retry_after)) if e.retry_after is not None else None
+            if e.quota_exhausted:
+                yield _sse_error(
+                    detail="AI service quota has been exhausted. Please try again later.",
+                    code="provider_quota_exhausted",
+                    retryable=False,
+                )
+            else:
+                detail = (
+                    f"AI provider rate limit exceeded. Please wait {retry_after_sec} seconds and try again."
+                    if retry_after_sec
+                    else "AI provider rate limit exceeded"
+                )
+                yield _sse_error(
+                    detail=detail,
+                    code="provider_rate_limit",
+                    retryable=e.retryable,
+                    retry_after=retry_after_sec,
+                )
         except ProviderUnavailableError as e:
             if not has_yielded:
                 _rollback_failed_turn()
             logger.warning(f"AI Provider streaming unavailable: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'AI service temporarily unavailable'})}\n\n"
+            yield _sse_error(
+                detail="AI service temporarily unavailable",
+                code="provider_unavailable",
+                retryable=True,
+            )
         except InvalidRequestError as e:
             if not has_yielded:
                 _rollback_failed_turn()
             logger.error(f"AI Provider streaming invalid request: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'Invalid request to AI service'})}\n\n"
+            yield _sse_error(
+                detail="Invalid request to AI service",
+                code="invalid_request",
+                retryable=False,
+            )
         except MalformedResponseError as e:
             if not has_yielded:
                 _rollback_failed_turn()
             logger.error(f"AI Provider streaming malformed response: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'The AI response was incomplete. Please try again.'})}\n\n"
+            yield _sse_error(
+                detail="The AI response was incomplete. Please try again.",
+                code="malformed_response",
+                retryable=True,
+            )
         except Exception as e:
             if not has_yielded:
                 _rollback_failed_turn()
             logger.error(f"Unexpected streaming error: {str(e)}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'An error occurred processing the AI request'})}\n\n"
+            yield _sse_error(
+                detail="An error occurred processing the AI request",
+                code="internal_error",
+                retryable=True,
+            )
         finally:
             if not producer_task.done():
                 producer_task.cancel()
@@ -510,7 +619,11 @@ async def chat_stream(
                     await producer_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            await ai_rate_limiter.release_concurrency(user_id=user_id, request=request)
+            await ai_rate_limiter.release_concurrency(
+                user_id=user_id,
+                request=request,
+                conversation_id=lock_conv_id,
+            )
 
     return StreamingResponse(
         event_generator(),
